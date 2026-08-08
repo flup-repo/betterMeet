@@ -33,8 +33,8 @@ Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 
 | File | Contents |
 |---|---|
-| `mic.caf` | your side (default input device, AAC) |
-| `system.caf` | everything the Mac played — the other side of the call (AAC) |
+| `mic.aac` | your side (default input device, AAC) |
+| `system.aac` | everything the Mac played — the other side of the call (AAC) |
 | `meta.json` | start/end timestamps, duration, per-track start offsets |
 | `transcript.json` | canonical transcript — engine provenance + timed, speaker-tagged segments |
 | `transcript.md` | the same transcript rendered for reading |
@@ -42,6 +42,6 @@ Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 
 Two tracks on purpose: speech models do better on clean single-source audio,
 and mic-vs-system is free two-party diarization — `me` vs `them` with no
-speaker-identification model. CAF on purpose: unlike m4a, it needs no
-finalization pass — if the process dies mid-meeting, everything already
-written is still readable.
+speaker-identification model. ADTS AAC on purpose: unlike AAC in CAF or m4a,
+each packet is framed independently, so audio written before an unclean exit
+remains readable.

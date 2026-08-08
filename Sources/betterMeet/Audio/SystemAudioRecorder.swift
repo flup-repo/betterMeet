@@ -15,6 +15,7 @@ final class SystemAudioRecorder {
         case ioProcCreationFailed(OSStatus)
         case deviceStartFailed(OSStatus)
         case fileCreationFailed(Error)
+        case writeFailed(Error)
 
         var description: String {
             switch self {
@@ -25,6 +26,7 @@ final class SystemAudioRecorder {
             case .ioProcCreationFailed(let s): return "IO proc creation failed (OSStatus \(s))"
             case .deviceStartFailed(let s): return "device start failed (OSStatus \(s))"
             case .fileCreationFailed(let e): return "output file creation failed: \(e)"
+            case .writeFailed(let e): return "system track write failed: \(e)"
             }
         }
     }
@@ -35,15 +37,19 @@ final class SystemAudioRecorder {
     private var file: AVAudioFile?
     private let queue = DispatchQueue(label: "com.flup-repo.betterMeet.system-tap")
     private(set) var isRecording = false
+    private var failed = false
+    var onFailure: (@Sendable (String) -> Void)?
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
     private(set) var firstBufferAt: Date?
+    /// Host time for the first frame, shared with AVAudioEngine's clock.
+    private(set) var firstBufferHostTime: UInt64?
 
-    /// Start capturing system audio, encoding AAC into `url` (use a .caf
-    /// extension — CAF needs no finalization pass, so a crash mid-meeting
-    /// loses nothing already written).
+    /// Start capturing system audio as an ADTS AAC stream. Each packet is
+    /// independently framed, so audio remains readable after an unclean exit.
     func start(writingTo url: URL) throws {
         guard !isRecording else { return }
+        failed = false
 
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
         description.name = "betterMeet system tap"
@@ -136,9 +142,13 @@ final class SystemAudioRecorder {
 
     private func installIOProc(format: AVAudioFormat) throws {
         var status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) {
-            [weak self] _, inInputData, _, _, _ in
-            guard let self, let file = self.file else { return }
+            [weak self] _, inInputData, inInputTime, _, _ in
+            guard let self, let file = self.file, !self.failed else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
+            if self.firstBufferHostTime == nil,
+               inInputTime.pointee.mFlags.contains(.hostTimeValid) {
+                self.firstBufferHostTime = inInputTime.pointee.mHostTime
+            }
             guard let buffer = AVAudioPCMBuffer(
                 pcmFormat: format,
                 bufferListNoCopy: inInputData,
@@ -147,13 +157,24 @@ final class SystemAudioRecorder {
             do {
                 try file.write(from: buffer)
             } catch {
-                FileHandle.standardError.write(Data("system track write failed: \(error)\n".utf8))
+                self.reportFailure(RecorderError.writeFailed(error))
             }
         }
         guard status == noErr, let procID else { throw RecorderError.ioProcCreationFailed(status) }
 
         status = AudioDeviceStart(aggregateID, procID)
         guard status == noErr else { throw RecorderError.deviceStartFailed(status) }
+    }
+
+    private func reportFailure(_ error: Error) {
+        guard !failed else { return }
+        failed = true
+        let message = String(describing: error)
+        FileHandle.standardError.write(Data("\(message)\n".utf8))
+        let handler = onFailure
+        DispatchQueue.main.async {
+            handler?(message)
+        }
     }
 
     private func cleanup() {

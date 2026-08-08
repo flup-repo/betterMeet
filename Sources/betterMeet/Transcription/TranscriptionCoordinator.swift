@@ -1,13 +1,30 @@
 import Foundation
 
 /// Post-recording pipeline: a serial queue of session folders to transcribe.
-/// mic.caf → "me", system.caf → "them"; each track's segments are shifted by
+/// mic.aac → "me", system.aac → "them"; each track's segments are shifted by
 /// its start offset, merged by timestamp, and written as transcript.json
 /// (canonical) plus transcript.md (readable). The filesystem is the queue —
 /// `resumePending()` rescans at launch, so a crash or quit mid-transcription
 /// just retries on next run. Failures append to the session's transcribe.log
 /// and never block later jobs.
 actor TranscriptionCoordinator {
+    enum PipelineError: Error, CustomStringConvertible {
+        case noReadableTracks
+        case invalidTimestamp
+        case hookLaunchFailed(Error)
+
+        var description: String {
+            switch self {
+            case .noReadableTracks:
+                return "no readable audio tracks"
+            case .invalidTimestamp:
+                return "transcription produced an invalid timestamp"
+            case .hookLaunchFailed(let error):
+                return "on_stop hook failed to launch: \(error)"
+            }
+        }
+    }
+
     enum Status: Sendable {
         case idle
         case transcribing(session: String, queued: Int)
@@ -15,6 +32,8 @@ actor TranscriptionCoordinator {
     }
 
     private var queue: [URL] = []
+    private var queued: Set<URL> = []
+    private var queueIndex = 0
     private var draining = false
     private var engine: TranscriptionEngine?
     private var lastFailure: String?
@@ -28,16 +47,21 @@ actor TranscriptionCoordinator {
     /// on_stop hook still fires — it just gets an untranscribed folder.
     func enqueue(_ sessionDir: URL) {
         guard Config.transcriptionEnabled() else {
-            runHook(for: sessionDir)
+            do {
+                try runHook(for: sessionDir)
+            } catch {
+                log(sessionDir, String(describing: error))
+            }
             return
         }
+        guard queued.insert(sessionDir).inserted else { return }
         queue.append(sessionDir)
         drainIfIdle()
     }
 
-    /// Scan the recordings root for sessions that finished (meta.json exists)
-    /// but were never transcribed. Folder names sort chronologically, so
-    /// oldest-first is a name sort.
+    /// Scan the recordings root for sessions without a completion marker.
+    /// Metadata is written at capture start, so uncleanly stopped sessions are
+    /// recoverable too. Folder names sort chronologically.
     func resumePending(root: URL) {
         guard Config.transcriptionEnabled() else { return }
         guard let entries = try? FileManager.default.contentsOfDirectory(
@@ -45,13 +69,21 @@ actor TranscriptionCoordinator {
         ) else { return }
 
         let fm = FileManager.default
-        let pending = entries
-            .filter {
-                fm.fileExists(atPath: $0.appendingPathComponent("meta.json").path)
-                    && !fm.fileExists(atPath: $0.appendingPathComponent("transcript.json").path)
+        var pending: [URL] = []
+        for dir in entries {
+            guard let meta = try? SessionMeta.read(from: dir) else { continue }
+            if meta.schemaVersion >= 2 {
+                if !fm.fileExists(atPath: dir.appendingPathComponent(".complete").path) {
+                    pending.append(dir)
+                }
+            } else if !fm.fileExists(
+                atPath: dir.appendingPathComponent("transcript.json").path
+            ) {
+                pending.append(dir)
             }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in pending where !queue.contains(dir) {
+        }
+        pending.sort { $0.lastPathComponent < $1.lastPathComponent }
+        for dir in pending where queued.insert(dir).inserted {
             queue.append(dir)
         }
         if !pending.isEmpty {
@@ -65,20 +97,30 @@ actor TranscriptionCoordinator {
     // MARK: -
 
     private func drainIfIdle() {
-        guard !draining, !queue.isEmpty else { return }
+        guard !draining, queueIndex < queue.count else { return }
         draining = true
         lastFailure = nil
         Task { await drain() }
     }
 
     private func drain() async {
-        while !queue.isEmpty {
-            let dir = queue.removeFirst()
-            publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
+        while queueIndex < queue.count {
+            let dir = queue[queueIndex]
+            queueIndex += 1
+            let remaining = queue.count - queueIndex
+            publish(.transcribing(session: dir.lastPathComponent, queued: remaining))
             do {
-                try await transcribe(dir)
+                let transcribed = dir.appendingPathComponent(".transcribed")
+                if !FileManager.default.fileExists(atPath: transcribed.path) {
+                    try await transcribe(dir)
+                    try Data().write(to: transcribed, options: .atomic)
+                }
+                try runHook(for: dir)
+                try Data().write(
+                    to: dir.appendingPathComponent(".complete"),
+                    options: .atomic
+                )
                 notifyUser(title: "betterMeet — transcript ready", body: dir.lastPathComponent)
-                runHook(for: dir)
             } catch {
                 log(dir, "transcription failed: \(error)")
                 lastFailure = dir.lastPathComponent
@@ -87,7 +129,10 @@ actor TranscriptionCoordinator {
                     body: "\(dir.lastPathComponent) — see transcribe.log"
                 )
             }
+            queued.remove(dir)
         }
+        queue.removeAll(keepingCapacity: true)
+        queueIndex = 0
         await engine?.release()
         engine = nil
         publish(lastFailure.map { .failed(session: $0) } ?? .idle)
@@ -102,6 +147,7 @@ actor TranscriptionCoordinator {
         let engine = try await preparedEngine()
 
         var merged: [Transcript.Segment] = []
+        var readableTracks = 0
         for track in meta.tracks {
             let audio = dir.appendingPathComponent(track.file)
             guard FileManager.default.fileExists(atPath: audio.path) else {
@@ -118,16 +164,25 @@ actor TranscriptionCoordinator {
                 log(dir, "skipping \(track.file): \(error)")
                 continue
             }
+            readableTracks += 1
             let offset = TimeInterval(track.offsetMs) / 1000
-            merged += segments.map {
-                Transcript.Segment(
+            for segment in segments {
+                guard
+                    let startMs = Self.milliseconds(segment.start + offset),
+                    let endMs = Self.milliseconds(segment.end + offset),
+                    endMs >= startMs
+                else {
+                    throw PipelineError.invalidTimestamp
+                }
+                merged.append(Transcript.Segment(
                     speaker: track.speaker,
-                    start_ms: Int(($0.start + offset) * 1000),
-                    end_ms: Int(($0.end + offset) * 1000),
-                    text: $0.text
-                )
+                    start_ms: startMs,
+                    end_ms: endMs,
+                    text: segment.text
+                ))
             }
         }
+        guard readableTracks > 0 else { throw PipelineError.noReadableTracks }
         merged.sort { $0.start_ms < $1.start_ms }
 
         let transcript = Transcript(
@@ -138,6 +193,16 @@ actor TranscriptionCoordinator {
         )
         try transcript.write(to: dir)
         log(dir, "done — \(merged.count) segments")
+    }
+
+    private static func milliseconds(_ seconds: TimeInterval) -> Int? {
+        let milliseconds = seconds * 1000
+        guard
+            milliseconds.isFinite,
+            milliseconds >= 0,
+            milliseconds <= Double(Int.max)
+        else { return nil }
+        return Int(milliseconds)
     }
 
     private func preparedEngine() async throws -> TranscriptionEngine {
@@ -157,7 +222,7 @@ actor TranscriptionCoordinator {
     /// Fires the configured on_stop shell command with the session directory
     /// as its sole argument, after the transcript exists (or immediately after
     /// recording when transcription is disabled).
-    private func runHook(for dir: URL) {
+    private func runHook(for dir: URL) throws {
         guard let cmd = Config.onStop() else { return }
         let task = Process()
         task.launchPath = "/bin/sh"
@@ -165,7 +230,7 @@ actor TranscriptionCoordinator {
         do {
             try task.run()
         } catch {
-            log(dir, "on_stop hook failed to launch: \(error)")
+            throw PipelineError.hookLaunchFailed(error)
         }
     }
 
@@ -195,6 +260,7 @@ private struct SessionMeta {
         let offsetMs: Int
     }
 
+    let schemaVersion: Int
     let tracks: [Track]
 
     enum MetaError: Error, CustomStringConvertible {
@@ -218,6 +284,9 @@ private struct SessionMeta {
         // Sessions recorded before offsets were captured default to 0 —
         // tracks start within tens of milliseconds of each other anyway.
         let offsets = json["start_offset_ms"] as? [String: Int] ?? [:]
+        guard offsets.values.allSatisfy({ $0 >= 0 }) else {
+            throw MetaError.unreadable(url)
+        }
         var tracks: [Track] = []
         if let mic = files["mic"] {
             tracks.append(Track(file: mic, speaker: "me", offsetMs: offsets["mic"] ?? 0))
@@ -225,7 +294,7 @@ private struct SessionMeta {
         if let system = files["system"] {
             tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0))
         }
-        return SessionMeta(tracks: tracks)
+        return SessionMeta(schemaVersion: json["schema_version"] as? Int ?? 1, tracks: tracks)
     }
 }
 
@@ -244,16 +313,15 @@ private struct Transcript: Codable {
     let created_at: String
     let segments: [Segment]
 
-    /// Write transcript.json and render transcript.md. Both writes are atomic
-    /// (temp file + rename), so a partially written transcript never exists on
-    /// disk — resumePending treats presence of transcript.json as "done".
+    /// Write Markdown first and canonical JSON last. Both writes are atomic,
+    /// and the coordinator writes its completion marker after post-processing.
     func write(to dir: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(self)
-            .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
         try Data(rendered(title: dir.lastPathComponent).utf8)
             .write(to: dir.appendingPathComponent("transcript.md"), options: .atomic)
+        try encoder.encode(self)
+            .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
     }
 
     private func rendered(title: String) -> String {

@@ -45,13 +45,18 @@ struct Run: ParsableCommand {
 
         let controller = AppController(root: root)
 
-        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sigint.setEventHandler {
+        let shutdownHandler = {
             FileHandle.standardError.write(Data("\nshutting down\n".utf8))
             MainActor.assumeIsolated { controller.shutdown() }
         }
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigint.setEventHandler(handler: shutdownHandler)
         sigint.resume()
         signal(SIGINT, SIG_IGN)
+        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigterm.setEventHandler(handler: shutdownHandler)
+        sigterm.resume()
+        signal(SIGTERM, SIG_IGN)
 
         FileHandle.standardError.write(Data(
             "betterMeet up · recordings → \(root.path) · ^C to quit\n".utf8
@@ -83,10 +88,10 @@ final class AppController {
     private let transcription = TranscriptionCoordinator()
     private var session: RecordingSession?
     private var ticker: Timer?
+    private var shuttingDown = false
 
     init(root: URL) {
         self.root = root
-        menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.update(recording: false, elapsed: nil)
@@ -98,14 +103,26 @@ final class AppController {
                 }
             }
             await transcription.resumePending(root: root)
+            await MainActor.run { [weak self] in
+                self?.menuBar.onToggle = { [weak self] in self?.toggle() }
+            }
         }
     }
 
     /// Stop any live session cleanly (finalizing files) and exit.
     func shutdown() {
-        stopSession()
+        guard !shuttingDown else { return }
+        shuttingDown = true
+        let pendingSession = stopSession(enqueue: false)
         menuBar.shutdown()
-        NSApp.terminate(nil)
+        Task { [transcription] in
+            if let pendingSession {
+                await transcription.enqueue(pendingSession)
+            }
+            await MainActor.run {
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     private func toggle() {
@@ -119,6 +136,18 @@ final class AppController {
     private func startSession() {
         do {
             let newSession = try RecordingSession(root: root)
+            let sessionID = ObjectIdentifier(newSession)
+            newSession.onFailure = { [weak self] message in
+                Task { @MainActor in
+                    guard
+                        let self,
+                        let session = self.session,
+                        ObjectIdentifier(session) == sessionID
+                    else { return }
+                    self.stopSession(failure: message)
+                    notifyUser(title: "betterMeet — recording stopped", body: message)
+                }
+            }
             try newSession.start()
             session = newSession
             FileHandle.standardError.write(Data("● recording → \(newSession.dir.path)\n".utf8))
@@ -129,25 +158,31 @@ final class AppController {
         }
 
         menuBar.update(recording: true, elapsed: "0:00")
-        ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        RunLoop.main.add(ticker, forMode: .common)
+        self.ticker = ticker
     }
 
-    private func stopSession() {
-        guard let session else { return }
-        session.stop()
+    @discardableResult
+    private func stopSession(failure: String? = nil, enqueue: Bool = true) -> URL? {
+        guard let session else { return nil }
+        self.session = nil
+        session.stop(failure: failure)
         let elapsed = Self.format(Date().timeIntervalSince(session.startedAt))
         FileHandle.standardError.write(Data(
             "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
         ))
-        self.session = nil
         ticker?.invalidate()
         ticker = nil
         menuBar.update(recording: false, elapsed: nil)
 
         let dir = session.dir
-        Task { [transcription] in await transcription.enqueue(dir) }
+        if enqueue {
+            Task { [transcription] in await transcription.enqueue(dir) }
+        }
+        return dir
     }
 
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {

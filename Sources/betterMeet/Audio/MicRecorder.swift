@@ -1,8 +1,8 @@
 import AVFoundation
 import Foundation
 
-/// Records the default input device to a file via AVAudioEngine, encoding AAC
-/// mono. Buffers stream straight to disk — nothing is held in memory, so
+/// Records the default input device to a mono ADTS AAC stream via AVAudioEngine.
+/// Buffers stream straight to disk — nothing is held in memory, so
 /// session length is unbounded.
 ///
 /// With voice processing enabled, Apple's echo canceller subtracts
@@ -25,12 +25,15 @@ final class MicRecorder: @unchecked Sendable {
         case engineStartFailed(Error)
         case fileCreationFailed(Error)
         case formatUnsupported(AVAudioFormat)
+        case configurationChanged
 
         var description: String {
             switch self {
             case .engineStartFailed(let e): return "mic engine start failed: \(e)"
             case .fileCreationFailed(let e): return "mic file creation failed: \(e)"
             case .formatUnsupported(let f): return "can't downmix mic format \(f)"
+            case .configurationChanged:
+                return "microphone device changed during recording"
             }
         }
     }
@@ -38,10 +41,14 @@ final class MicRecorder: @unchecked Sendable {
     private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     private var url: URL?
+    private var configurationObserver: NSObjectProtocol?
     private(set) var isRecording = false
+    var onFailure: (@Sendable (String) -> Void)?
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
     private(set) var firstBufferAt: Date?
+    /// Host time for the first frame, shared with Core Audio's clock.
+    private(set) var firstBufferHostTime: UInt64?
 
     // Liveness check state (voice-processing path only). Written from the tap
     // callback, read on main when deciding to fall back.
@@ -50,8 +57,8 @@ final class MicRecorder: @unchecked Sendable {
     private var livenessSettled = false
     private var writeFailed = false
 
-    /// Start capturing the mic, encoding AAC into `url` (use a .caf extension
-    /// — CAF needs no finalization pass, so a crash loses nothing written).
+    /// Start capturing the mic as an ADTS AAC stream, which remains readable
+    /// if the process exits before the file is closed.
     func start(writingTo url: URL) throws {
         guard !isRecording else { return }
         self.url = url
@@ -63,6 +70,7 @@ final class MicRecorder: @unchecked Sendable {
     func stop() {
         guard isRecording else { return }
         isRecording = false
+        removeConfigurationObserver()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         file = nil
@@ -70,7 +78,7 @@ final class MicRecorder: @unchecked Sendable {
 
     // MARK: -
 
-    /// Build the engine graph, create the AAC file, and start capture. Called
+    /// Build the engine graph, create the AAC stream, and start capture. Called
     /// once at start, and a second time (voiceProcessing: false) if the
     /// liveness check trips.
     private func attach(voiceProcessing: Bool) throws {
@@ -159,6 +167,7 @@ final class MicRecorder: @unchecked Sendable {
             file = nil
             throw RecorderError.engineStartFailed(error)
         }
+        installConfigurationObserver(for: engine)
 
         let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
             + "input=\(input.outputFormat(forBus: 0)) recording=\(recordingFormat)\n"
@@ -186,9 +195,12 @@ final class MicRecorder: @unchecked Sendable {
             onBus: 0,
             bufferSize: 4096,
             format: captureFormat
-        ) { [weak self] buffer, _ in
+        ) { [weak self] buffer, time in
             guard let self, let file = self.file, !self.writeFailed else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
+            if self.firstBufferHostTime == nil, time.isHostTimeValid {
+                self.firstBufferHostTime = time.hostTime
+            }
 
             if !self.livenessSettled {
                 let frames = Int(buffer.frameLength)
@@ -238,9 +250,13 @@ final class MicRecorder: @unchecked Sendable {
         configure(converter)
         let conversionState = ConversionState()
 
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) {
+            [weak self] buffer, time in
             guard let self, let file = self.file, !self.writeFailed else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
+            if self.firstBufferHostTime == nil, time.isHostTimeValid {
+                self.firstBufferHostTime = time.hostTime
+            }
             do {
                 let converted = try self.convert(
                     buffer,
@@ -309,7 +325,34 @@ final class MicRecorder: @unchecked Sendable {
     private func reportWriteFailure(_ error: Error) {
         guard !writeFailed else { return }
         writeFailed = true
-        FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
+        let message = "mic track write failed: \(error)"
+        DispatchQueue.main.async { [weak self] in
+            FileHandle.standardError.write(Data("\(message)\n".utf8))
+            self?.onFailure?(message)
+        }
+    }
+
+    private func installConfigurationObserver(for engine: AVAudioEngine) {
+        removeConfigurationObserver()
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isRecording else { return }
+                let message = String(describing: RecorderError.configurationChanged)
+                FileHandle.standardError.write(Data("\(message)\n".utf8))
+                self.onFailure?(message)
+            }
+        }
+    }
+
+    private func removeConfigurationObserver() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
     }
 
     /// The voice-processing route delivered a full second of digital silence:
@@ -320,10 +363,12 @@ final class MicRecorder: @unchecked Sendable {
         FileHandle.standardError.write(Data(
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))
+        removeConfigurationObserver()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         file = nil
         firstBufferAt = nil
+        firstBufferHostTime = nil
         if let url {
             try? FileManager.default.removeItem(at: url)
         }
