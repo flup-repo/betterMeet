@@ -5,6 +5,11 @@ click records your mic and all system audio as two separate tracks; when you
 stop, betterMeet transcribes both on-device and writes a speaker-tagged transcript.
 Nothing ever leaves the machine.
 
+## Download
+
+[Download betterMeet 1.0.0 for Apple Silicon](https://github.com/flup-repo/betterMeet/releases/tag/v1.0.0)
+from the GitHub release page.
+
 ## Install
 
 ```sh
@@ -22,9 +27,7 @@ transcription speed.
 
 1. **Run it** (`betterMeet` in a terminal, or the LaunchAgent).
 2. **Click the feather in the menu bar → Start recording.** First use prompts
-   for microphone and System Audio Recording permissions. While recording, the
-   icon turns red with a running elapsed counter, and macOS shows the purple
-   recording indicator.
+   for microphone and System Audio Recording permissions.
 3. **Click → Stop recording** when the meeting ends. Transcription starts
    automatically (the menu shows progress); a notification fires when the
    transcript is ready.
