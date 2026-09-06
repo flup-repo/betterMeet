@@ -14,7 +14,9 @@ final class MenuBarController {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
 
-    var onToggle: (() -> Void)?
+    var onToggle: (() -> Void)? {
+        didSet { toggleItem.isEnabled = onToggle != nil }
+    }
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
 
@@ -41,6 +43,7 @@ final class MenuBarController {
             keyEquivalent: "r"
         )
         toggleItem.keyEquivalentModifierMask = [.control, .option]
+        toggleItem.isEnabled = false
         menu.addItem(toggleItem)
 
         let openFolder = NSMenuItem(

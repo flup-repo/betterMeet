@@ -38,10 +38,18 @@ enum Config {
         transcription()?["enabled"] as? Bool ?? true
     }
 
-    /// Configured engine name. Only "parakeet" ships today; the coordinator
-    /// warns and falls back for anything else.
-    static func transcriptionEngine() -> String {
-        transcription()?["engine"] as? String ?? "parakeet"
+    static func transcriptionSettings() throws -> TranscriptionSettings {
+        guard FileManager.default.fileExists(atPath: path.path) else { return TranscriptionSettings() }
+        let data = try Data(contentsOf: path)
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TranscriptionFailure("config must be a JSON object")
+        }
+        guard let value = root["transcription"] else { return TranscriptionSettings() }
+        guard let object = value as? [String: Any] else {
+            throw TranscriptionFailure("transcription must be a JSON object")
+        }
+        let settingsData = try JSONSerialization.data(withJSONObject: object)
+        return try JSONDecoder().decode(TranscriptionSettings.self, from: settingsData)
     }
 
     private static func transcription() -> [String: Any]? {

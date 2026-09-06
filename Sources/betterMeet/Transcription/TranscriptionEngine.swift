@@ -2,10 +2,21 @@ import Foundation
 
 /// One timed span of recognized speech from a single track, relative to that
 /// track's own start.
-struct TranscriptSegment: Sendable {
+struct TranscriptSegment: Codable, Sendable {
     let start: TimeInterval
     let end: TimeInterval
     let text: String
+    var originalText: String? = nil
+    var flags: [String] = []
+    var rmsDBFS: Double? = nil
+    var excluded: Bool = false
+}
+
+struct TrackTranscription: Codable, Sendable {
+    let duration: Double
+    let processingSeconds: Double
+    let rawText: String
+    let segments: [TranscriptSegment]
 }
 
 /// A speech-to-text engine betterMeet can run locally. Engines are prepared lazily
@@ -17,6 +28,6 @@ protocol TranscriptionEngine: Sendable {
     /// Concrete model identifier recorded as transcript.json provenance.
     var model: String { get }
     func prepare() async throws
-    func transcribe(_ audio: URL) async throws -> [TranscriptSegment]
+    func transcribe(_ audio: URL) async throws -> TrackTranscription
     func release() async
 }

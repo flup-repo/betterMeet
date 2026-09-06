@@ -7,9 +7,33 @@ struct BetterMeet: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "betterMeet",
         abstract: "Local meeting recorder + transcriber. Records mic and system audio as two tracks, then transcribes on-device.",
-        subcommands: [Run.self, Doctor.self, Install.self],
+        subcommands: [Run.self, Doctor.self, Install.self, Transcribe.self, TranscriptionWorker.self],
         defaultSubcommand: Run.self
     )
+
+    /// Keep AppKit's entrypoint synchronous. Only headless commands enter the
+    /// Swift async runtime; blocking NSApplication.run inside it starves UI tasks.
+    static func main() {
+        do {
+            var command = try parseAsRoot()
+            if let asynchronous = command as? any AsyncParsableCommand {
+                Task.detached {
+                    var command = asynchronous
+                    do {
+                        try await command.run()
+                        exit()
+                    } catch {
+                        exit(withError: error)
+                    }
+                }
+                dispatchMain()
+            } else {
+                try command.run()
+            }
+        } catch {
+            exit(withError: error)
+        }
+    }
 }
 
 struct Run: ParsableCommand {
@@ -22,15 +46,12 @@ struct Run: ParsableCommand {
     var out: String?
 
     func run() throws {
-        // ArgumentParser invokes run() on the main thread; promote that fact
-        // to the type system so AppKit calls are cleanly isolated.
-        try MainActor.assumeIsolated { try runMain() }
+        let root = Config.resolveRoot(cliOverride: out)
+        try MainEventLoop.run { try Self.runMain(root: root) }
     }
 
     @MainActor
-    private func runMain() throws {
-        let root = Config.resolveRoot(cliOverride: out)
-
+    private static func runMain(root: URL) throws {
         // Non-blocking: permissions prompt on first recording, so warnings at
         // startup are informational, not fatal.
         let checks = DoctorReport.run(recordingsRoot: root)
@@ -105,6 +126,7 @@ final class AppController {
             await transcription.resumePending(root: root)
             await MainActor.run { [weak self] in
                 self?.menuBar.onToggle = { [weak self] in self?.toggle() }
+                FileHandle.standardError.write(Data("recording controls ready\n".utf8))
             }
         }
     }

@@ -88,6 +88,12 @@ final class RecordingSession {
             "state": endedAt == nil ? "recording" : (failure == nil ? "finished" : "failed"),
             "files": ["mic": "mic.aac", "system": "system.aac"],
             "start_offset_ms": ["mic": offsets.mic, "system": offsets.system],
+            "capture": [
+                "mic_voice_processing_requested": mic.voiceProcessingRequested,
+                "mic_voice_processing_active": mic.voiceProcessingActive,
+                "mic_voice_processing_fallback": mic.voiceProcessingFallback,
+                "aac_bitrate_per_channel": 96_000,
+            ],
         ]
         if let endedAt {
             meta["ended"] = iso.string(from: endedAt)

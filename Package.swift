@@ -9,7 +9,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.7.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.5"),
     ],
     targets: [
         .executableTarget(
@@ -34,6 +34,7 @@ let package = Package(
                 .plugin(name: "InfoPlistDependencyPlugin"),
             ]
         ),
+        .testTarget(name: "betterMeetTests", dependencies: ["betterMeet"]),
         .plugin(
             name: "InfoPlistDependencyPlugin",
             capability: .buildTool()

@@ -127,6 +127,8 @@ final class SystemAudioRecorder {
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: format.sampleRate,
             AVNumberOfChannelsKey: format.channelCount,
+            AVEncoderBitRateKey: 96_000 * Int(format.channelCount),
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
         do {
             return try AVAudioFile(

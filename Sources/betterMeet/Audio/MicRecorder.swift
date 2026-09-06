@@ -43,6 +43,9 @@ final class MicRecorder: @unchecked Sendable {
     private var url: URL?
     private var configurationObserver: NSObjectProtocol?
     private(set) var isRecording = false
+    private(set) var voiceProcessingRequested = false
+    private(set) var voiceProcessingActive = false
+    private(set) var voiceProcessingFallback = false
     var onFailure: (@Sendable (String) -> Void)?
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -62,7 +65,8 @@ final class MicRecorder: @unchecked Sendable {
     func start(writingTo url: URL) throws {
         guard !isRecording else { return }
         self.url = url
-        try attach(voiceProcessing: Config.micVoiceProcessing())
+        voiceProcessingRequested = Config.micVoiceProcessing()
+        try attach(voiceProcessing: voiceProcessingRequested)
         isRecording = true
     }
 
@@ -124,6 +128,8 @@ final class MicRecorder: @unchecked Sendable {
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: recordingFormat.sampleRate,
             AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 96_000,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
         do {
             file = try AVAudioFile(
@@ -136,6 +142,8 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.fileCreationFailed(error)
         }
         writeFailed = false
+        voiceProcessingActive = voice
+        voiceProcessingFallback = voiceProcessingRequested && !voice
 
         if voice {
             // Complete the duplex graph: VoiceProcessingIO must render to an
@@ -360,6 +368,8 @@ final class MicRecorder: @unchecked Sendable {
     /// the track's timestamps start at real audio.
     private func fallBackToRaw() {
         guard isRecording else { return }
+        voiceProcessingActive = false
+        voiceProcessingFallback = true
         FileHandle.standardError.write(Data(
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))

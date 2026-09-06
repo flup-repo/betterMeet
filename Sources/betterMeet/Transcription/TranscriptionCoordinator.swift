@@ -9,16 +9,10 @@ import Foundation
 /// and never block later jobs.
 actor TranscriptionCoordinator {
     enum PipelineError: Error, CustomStringConvertible {
-        case noReadableTracks
-        case invalidTimestamp
         case hookLaunchFailed(Error)
 
         var description: String {
             switch self {
-            case .noReadableTracks:
-                return "no readable audio tracks"
-            case .invalidTimestamp:
-                return "transcription produced an invalid timestamp"
             case .hookLaunchFailed(let error):
                 return "on_stop hook failed to launch: \(error)"
             }
@@ -35,7 +29,6 @@ actor TranscriptionCoordinator {
     private var queued: Set<URL> = []
     private var queueIndex = 0
     private var draining = false
-    private var engine: TranscriptionEngine?
     private var lastFailure: String?
     private var statusHandler: (@Sendable (Status) -> Void)?
 
@@ -133,90 +126,19 @@ actor TranscriptionCoordinator {
         }
         queue.removeAll(keepingCapacity: true)
         queueIndex = 0
-        await engine?.release()
-        engine = nil
         publish(lastFailure.map { .failed(session: $0) } ?? .idle)
         draining = false
-        // An enqueue that landed between the loop exiting and the release
-        // finishing would otherwise sit until the next enqueue.
         drainIfIdle()
     }
 
     private func transcribe(_ dir: URL) async throws {
-        let meta = try SessionMeta.read(from: dir)
-        let engine = try await preparedEngine()
-
-        var merged: [Transcript.Segment] = []
-        var readableTracks = 0
-        for track in meta.tracks {
-            let audio = dir.appendingPathComponent(track.file)
-            guard FileManager.default.fileExists(atPath: audio.path) else {
-                log(dir, "skipping missing track \(track.file)")
-                continue
-            }
-            log(dir, "transcribing \(track.file) (\(engine.name))")
-            // One bad track (empty, truncated) shouldn't cost us the other's
-            // transcript — log it and keep going.
-            let segments: [TranscriptSegment]
-            do {
-                segments = try await engine.transcribe(audio)
-            } catch {
-                log(dir, "skipping \(track.file): \(error)")
-                continue
-            }
-            readableTracks += 1
-            let offset = TimeInterval(track.offsetMs) / 1000
-            for segment in segments {
-                guard
-                    let startMs = Self.milliseconds(segment.start + offset),
-                    let endMs = Self.milliseconds(segment.end + offset),
-                    endMs >= startMs
-                else {
-                    throw PipelineError.invalidTimestamp
-                }
-                merged.append(Transcript.Segment(
-                    speaker: track.speaker,
-                    start_ms: startMs,
-                    end_ms: endMs,
-                    text: segment.text
-                ))
-            }
-        }
-        guard readableTracks > 0 else { throw PipelineError.noReadableTracks }
-        merged.sort { $0.start_ms < $1.start_ms }
-
-        let transcript = Transcript(
-            engine: engine.name,
-            model: engine.model,
-            created_at: ISO8601DateFormatter().string(from: Date()),
-            segments: merged
+        let document = try await TranscriptionWorker.transcribe(
+            source: dir, output: dir, settings: Config.transcriptionSettings()
         )
-        try transcript.write(to: dir)
-        log(dir, "done — \(merged.count) segments")
-    }
-
-    private static func milliseconds(_ seconds: TimeInterval) -> Int? {
-        let milliseconds = seconds * 1000
-        guard
-            milliseconds.isFinite,
-            milliseconds >= 0,
-            milliseconds <= Double(Int.max)
-        else { return nil }
-        return Int(milliseconds)
-    }
-
-    private func preparedEngine() async throws -> TranscriptionEngine {
-        if let engine { return engine }
-        let configured = Config.transcriptionEngine()
-        if configured != "parakeet" {
-            FileHandle.standardError.write(Data(
-                "warning: unknown transcription engine \"\(configured)\" — using parakeet\n".utf8
-            ))
+        log(dir, "\(document.status) — \(document.segments.count) segments")
+        guard document.status == "complete" else {
+            throw TranscriptionFailure("incomplete transcription; successful tracks saved, see transcript.json")
         }
-        let engine = ParakeetEngine()
-        try await engine.prepare()
-        self.engine = engine
-        return engine
     }
 
     /// Fires the configured on_stop shell command with the session directory
@@ -253,7 +175,7 @@ actor TranscriptionCoordinator {
 
 /// The slice of meta.json the coordinator needs: which files exist, who they
 /// represent, and how far each track started after the earliest one.
-private struct SessionMeta {
+struct SessionMeta {
     struct Track {
         let file: String
         let speaker: String
@@ -262,6 +184,7 @@ private struct SessionMeta {
 
     let schemaVersion: Int
     let tracks: [Track]
+    let duration: Double?
 
     enum MetaError: Error, CustomStringConvertible {
         case unreadable(URL)
@@ -283,61 +206,28 @@ private struct SessionMeta {
 
         // Sessions recorded before offsets were captured default to 0 —
         // tracks start within tens of milliseconds of each other anyway.
+        if let value = json["start_offset_ms"], !(value is [String: Int]) {
+            throw MetaError.unreadable(url)
+        }
         let offsets = json["start_offset_ms"] as? [String: Int] ?? [:]
         guard offsets.values.allSatisfy({ $0 >= 0 }) else {
             throw MetaError.unreadable(url)
         }
         var tracks: [Track] = []
+        guard files.values.allSatisfy({
+            !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/") && !$0.contains("\\")
+        }) else { throw MetaError.unreadable(url) }
         if let mic = files["mic"] {
             tracks.append(Track(file: mic, speaker: "me", offsetMs: offsets["mic"] ?? 0))
         }
         if let system = files["system"] {
             tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0))
         }
-        return SessionMeta(schemaVersion: json["schema_version"] as? Int ?? 1, tracks: tracks)
-    }
-}
-
-/// Canonical transcript. Property names are the JSON schema — this struct
-/// exists to be serialized.
-private struct Transcript: Codable {
-    struct Segment: Codable {
-        let speaker: String
-        let start_ms: Int
-        let end_ms: Int
-        let text: String
-    }
-
-    let engine: String
-    let model: String
-    let created_at: String
-    let segments: [Segment]
-
-    /// Write Markdown first and canonical JSON last. Both writes are atomic,
-    /// and the coordinator writes its completion marker after post-processing.
-    func write(to dir: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try Data(rendered(title: dir.lastPathComponent).utf8)
-            .write(to: dir.appendingPathComponent("transcript.md"), options: .atomic)
-        try encoder.encode(self)
-            .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
-    }
-
-    private func rendered(title: String) -> String {
-        var lines = ["# \(title)", "", "engine: \(engine) (\(model))", ""]
-        for seg in segments {
-            lines.append("**[\(Self.clock(seg.start_ms))] \(seg.speaker):** \(seg.text)")
-            lines.append("")
+        guard !tracks.isEmpty else { throw MetaError.unreadable(url) }
+        let duration = json["duration_seconds"] as? Double
+        if let duration {
+            guard duration.isFinite, duration >= 0 else { throw MetaError.unreadable(url) }
         }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func clock(_ ms: Int) -> String {
-        let total = ms / 1000
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%d:%02d", m, s)
+        return SessionMeta(schemaVersion: json["schema_version"] as? Int ?? 1, tracks: tracks, duration: duration)
     }
 }
