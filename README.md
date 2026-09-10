@@ -24,7 +24,7 @@ runs `/usr/local/bin/betterMeet`, not the build output.
 
 ## Record
 
-1. Click the feather in the menu bar, then **Start recording**.
+1. Click the eye icon in the menu bar, then **Start recording**.
 2. Grant microphone and system-audio permissions when prompted.
 3. Click **Stop recording**. Transcription runs automatically.
 
