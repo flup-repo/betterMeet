@@ -1,10 +1,10 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// Status bar item in the top-right of the menu bar. The icon stays visually
-/// unchanged while recording so screen sharing does not reveal capture state.
-/// The menu provides the daemon's only persistent control surface (since we
-/// run as `.accessory` — no dock icon, no main window).
+/// Status bar item in the top-right of the menu bar. The icon switches from
+/// an outline feather to a filled one while recording so the capture state is
+/// visible at a glance. The menu provides the daemon's only persistent control
+/// surface (since we run as `.accessory` — no dock icon, no main window).
 @MainActor
 final class MenuBarController {
     private let statusItem: NSStatusItem
@@ -69,9 +69,7 @@ final class MenuBarController {
         statusItem.menu = menu
 
         if let button = statusItem.button {
-            let image = Self.featherImage()
-            image?.isTemplate = true
-            button.image = image
+            button.image = Self.featherImage()
             button.imagePosition = .imageLeft
         }
 
@@ -129,11 +127,14 @@ final class MenuBarController {
         }
     }
 
-    /// Reflect recording state only in the menu item titles. The status-bar
-    /// icon deliberately remains unchanged. Call once a second while recording.
+    /// Reflect recording state in the menu item titles and in the status-bar
+    /// icon (filled feather while recording). Call once a second while recording.
     func update(recording: Bool, elapsed: String?) {
         stateLabel.title = recording ? "● recording · \(elapsed ?? "0:00")" : "idle"
         toggleItem.title = recording ? "Stop recording" : "Start recording"
+        if let button = statusItem.button {
+            button.image = recording ? Self.featherFilledImage() : Self.featherImage()
+        }
     }
 
     /// Show transcription progress/failure as a second status line in the
@@ -158,11 +159,32 @@ final class MenuBarController {
     """
 
     private static func featherImage() -> NSImage? {
-        guard let data = featherSVG.data(using: .utf8),
+        svgImage(featherSVG)
+    }
+
+    /// Same feather, solid-filled: the recording-state variant. Both stay
+    /// template images so macOS recolors them for the menu bar appearance.
+    private static let featherFilledSVG = """
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" \
+    viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" \
+    stroke-linecap="round" stroke-linejoin="round">\
+    <path d="M12.67 19a2 2 0 0 0 1.416-.588l6.154-6.172a6 6 0 0 0-8.49-8.49L5.586 9.914A2 2 0 0 0 5 11.328V18a1 1 0 0 0 1 1z"/>\
+    <path d="M16 8 2 22"/>\
+    <path d="M17.5 15H9"/>\
+    </svg>
+    """
+
+    private static func featherFilledImage() -> NSImage? {
+        svgImage(featherFilledSVG)
+    }
+
+    private static func svgImage(_ svg: String) -> NSImage? {
+        guard let data = svg.data(using: .utf8),
               let image = NSImage(data: data)
         else { return nil }
         // Menu-bar status icons are nominally 18pt tall; size the SVG to match.
         image.size = NSSize(width: 16, height: 16)
+        image.isTemplate = true
         return image
     }
 
