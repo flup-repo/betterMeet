@@ -32,22 +32,21 @@ final class DictationController {
     }
     var onState: ((DictationState) -> Void)?
     private let capture = DictationCapture()
-    private let panel = DictationPanel()
     private var destination: DictationDestination?
     private var generation = UUID()
     private var previewTask: Task<Void, Never>?
     private var ticker: Timer?
     private var previewInFlight: Task<InferenceReply, Error>?
     private var preview = ""
+    private var previewRange: CFRange?
+    private var insertedPreview: String?
+    private var previewUsedTyping = false
+    private var previewInsertFailed = false
     private var targetChanged = false
     private var sleepObserver: NSObjectProtocol?
     private var inputMonitor: Any?
 
     init() {
-        panel.onCancel = { [weak self] in
-            guard let self, self.state != .inserting else { return }
-            self.cancel()
-        }
         capture.onFailure = { [weak self] in
             self?.fail("Microphone changed. Dictation cancelled; please retry.")
         }
@@ -80,13 +79,17 @@ final class DictationController {
         capture.discard()
         destination = nil
         preview = ""
+        previewRange = nil
+        insertedPreview = nil
+        previewUsedTyping = false
+        previewInsertFailed = false
         state = .idle
-        panel.hide()
     }
 
     private func start() {
         generation = UUID()
         let id = generation
+        FileHandle.standardError.write(Data("dictation start id=\(id.uuidString.prefix(8)) state=\(state)\n".utf8))
         let originalAppPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         destination = DictationDestination.capture()
         targetChanged = false
@@ -96,15 +99,18 @@ final class DictationController {
                 type: event.type, keyCode: event.type == .keyDown ? event.keyCode : 0
             )
             guard shouldInvalidate else { return }
+            FileHandle.standardError.write(Data("dictation input invalidated type=\(event.type.rawValue) keyCode=\(event.keyCode)\n".utf8))
             Task { @MainActor in
                 guard let self, self.generation == id else { return }
                 self.targetChanged = true
             }
         }
         preview = ""
+        previewRange = nil
+        insertedPreview = nil
+        previewUsedTyping = false
+        previewInsertFailed = false
         state = .preparing
-        panel.show(status: "Preparing multilingual model…",
-                   text: "First use may download models. Waiting for any active meeting transcription.")
         if !AXIsProcessTrusted() { DictationDestination.requestPermission() }
         Task {
             let allowed = await AVCaptureDevice.requestAccess(for: .audio)
@@ -128,18 +134,24 @@ final class DictationController {
                 }
                 try capture.start()
                 state = .listening
-                panel.show(status: "Listening · F9 to finish · 60-second limit",
-                           text: destination == nil ? "No supported text field. Your result will have a Copy button." : "")
+                FileHandle.standardError.write(Data("dictation listening id=\(id.uuidString.prefix(8))\n".utf8))
                 startPreview(id: id)
                 let listeningStarted = ContinuousClock.now
                 let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
                     MainActor.assumeIsolated {
                         guard let self, self.state == .listening else { return }
-                        if !self.targetChanged, let reason = self.destination?.rejectionReason() {
-                            FileHandle.standardError.write(Data("dictation destination invalidated: \(reason)\n".utf8))
-                            self.targetChanged = true
+                        if !self.targetChanged, let destination = self.destination {
+                            // Typed previews intentionally change the text, so
+                            // only focus/window/field changes invalidate the target.
+                            let reason = (self.previewUsedTyping || self.previewRange != nil)
+                                ? destination.focusRejectionReason()
+                                : destination.rejectionReason()
+                            if let reason {
+                                FileHandle.standardError.write(Data("dictation destination invalidated: \(reason)\n".utf8))
+                                self.targetChanged = true
+                            }
                         }
-                        if self.capture.audio.isFull || listeningStarted.duration(to: .now) >= .seconds(60) {
+                        if self.capture.audio.isFull || listeningStarted.duration(to: .now) >= .seconds(Config.dictationMaximumSeconds()) {
                             self.finish()
                         }
                     }
@@ -171,7 +183,7 @@ final class DictationController {
                     guard !Task.isCancelled, generation == id, state == .listening else { return }
                     previewInFlight = nil
                     preview = reply.text ?? ""
-                    panel.show(status: "Listening · F9 to finish · preview may change", text: preview)
+                    insertPreview(preview)
                 } catch is CancellationError {
                     return
                 } catch {
@@ -186,6 +198,7 @@ final class DictationController {
     private func finish() {
         guard state == .listening else { return }
         let id = generation
+        FileHandle.standardError.write(Data("dictation finish id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil) targetChanged=\(targetChanged)\n".utf8))
         state = .processing
         ticker?.invalidate()
         ticker = nil
@@ -193,7 +206,6 @@ final class DictationController {
         previewTask?.cancel()
         previewTask = nil
         let activePreview = previewInFlight
-        panel.show(status: "Processing dictation…", text: preview)
         let began = ContinuousClock.now
         Task {
             do {
@@ -202,6 +214,7 @@ final class DictationController {
                 if let activePreview { _ = try? await activePreview.value }
                 guard generation == id else { return }
                 guard !samples.isEmpty else {
+                    FileHandle.standardError.write(Data("dictation finish empty_audio id=\(id.uuidString.prefix(8))\n".utf8))
                     fail("No microphone audio received. Please retry.")
                     return
                 }
@@ -213,14 +226,29 @@ final class DictationController {
                 let text = reply.text ?? ""
                 let insertion: DictationDestination.InsertionResult
                 stopInputMonitor()
-                if !text.isEmpty, !targetChanged, let destination {
+                if !text.isEmpty, self.destination != nil {
                     state = .inserting
-                    panel.show(status: "Inserting dictation…", text: text, cancellable: false)
-                    insertion = await destination.insert(text)
+                    FileHandle.standardError.write(Data("dictation insert id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil)\n".utf8))
+                    if previewUsedTyping, let inserted = insertedPreview {
+                        if text == inserted {
+                            insertion = .inserted
+                        } else if self.destination?.deleteBackward(inserted.utf16.count) == true,
+                                  self.destination?.type(text) == true {
+                            insertion = .inserted
+                        } else {
+                            insertion = .copyRequired
+                        }
+                    } else if let range = previewRange {
+                        insertion = self.destination?.replace(range: range, with: text) == true ? .inserted : .copyRequired
+                    } else if let destination = self.destination {
+                        insertion = await destination.insert(text)
+                    } else {
+                        insertion = .copyRequired
+                    }
                 } else {
                     insertion = .copyRequired
                     FileHandle.standardError.write(Data(
-                        "dictation copy fallback: destination=\(destination != nil) input_or_target_changed=\(targetChanged)\n".utf8
+                        "dictation copy fallback: destination=\(destination != nil) text=\(!text.isEmpty)\n".utf8
                     ))
                 }
                 guard generation == id else { return }
@@ -229,16 +257,23 @@ final class DictationController {
                 let timing = String(format: "%.2f s", seconds)
                 state = .idle
                 preview = ""
-                if text.isEmpty {
-                    panel.show(status: "No speech detected.", busy: false)
-                } else if insertion == .inserted {
-                    panel.show(status: "Inserted · \(timing) · review names and numbers", text: text, busy: false)
-                } else if insertion == .unconfirmed {
-                    panel.show(status: "Paste sent · check your destination before pasting again", text: text, busy: false)
+                if !text.isEmpty {
+                    switch insertion {
+                    case .inserted:
+                        break
+                    case .unconfirmed, .copyRequired:
+                        let board = NSPasteboard.general
+                        board.clearContents()
+                        board.setString(text, forType: .string)
+                        FileHandle.standardError.write(Data("dictation insertion fallback=clipboard timing=\(timing)\n".utf8))
+                    }
                 } else {
-                    panel.show(status: "Ready · \(timing) · copy to your chosen field", text: text, busy: false)
+                    FileHandle.standardError.write(Data("dictation result=no_speech timing=\(timing)\n".utf8))
                 }
                 destination = nil
+                previewRange = nil
+                insertedPreview = nil
+                previewUsedTyping = false
             } catch {
                 guard generation == id else { return }
                 fail("Dictation failed. Please retry; no text was inserted.")
@@ -248,11 +283,54 @@ final class DictationController {
 
     private func fail(_ message: String) {
         cancel()
-        panel.show(status: message, busy: false)
+        FileHandle.standardError.write(Data("dictation failed: \(message)\n".utf8))
     }
 
     private func stopInputMonitor() {
         if let inputMonitor { NSEvent.removeMonitor(inputMonitor) }
         inputMonitor = nil
+    }
+
+    /// Best-effort live preview: type only the part of the transcript that
+    /// actually changed, so pauses don't erase the whole preview.
+    private func insertPreview(_ text: String) {
+        guard !text.isEmpty, !targetChanged, !previewInsertFailed,
+              self.destination != nil, self.destination?.focusUnchanged() == true else { return }
+        if let inserted = insertedPreview {
+            guard text != inserted else { return }
+            let oldUnits = Array(inserted.utf16)
+            let newUnits = Array(text.utf16)
+            var common = 0
+            while common < oldUnits.count, common < newUnits.count,
+                  oldUnits[common] == newUnits[common] {
+                common += 1
+            }
+            let deleteCount = oldUnits.count - common
+            let suffix = String(decoding: newUnits[common...], as: UTF16.self)
+            if deleteCount > 0, self.destination?.deleteBackward(deleteCount) != true {
+                previewInsertFailed = true
+                FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+                return
+            }
+            if !suffix.isEmpty, self.destination?.type(suffix) == true {
+                insertedPreview = text
+                previewUsedTyping = true
+                FileHandle.standardError.write(Data("dictation live preview revised delete=\(deleteCount) len=\(suffix.utf16.count)\n".utf8))
+            } else if deleteCount == 0 && suffix.isEmpty {
+                insertedPreview = text
+            } else {
+                previewInsertFailed = true
+                FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+            }
+            return
+        }
+        if self.destination?.type(text) == true {
+            insertedPreview = text
+            previewUsedTyping = true
+            FileHandle.standardError.write(Data("dictation live preview typed len=\(text.utf16.count)\n".utf8))
+        } else {
+            previewInsertFailed = true
+            FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+        }
     }
 }

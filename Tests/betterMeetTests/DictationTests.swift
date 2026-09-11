@@ -17,6 +17,17 @@ final class DictationTests: XCTestCase {
         XCTAssertFalse(DictationState.inserting.canCancel)
     }
 
+    func testDictationHoldAndToggleShortcutBehavior() {
+        // A quick press leaves dictation running until the next press.
+        XCTAssertFalse(DictationShortcut.shouldStopOnRelease(elapsed: 0.1, state: .listening))
+        // Holding long enough acts as push-to-talk and stops on release.
+        XCTAssertTrue(DictationShortcut.shouldStopOnRelease(elapsed: 1.1, state: .listening))
+        XCTAssertTrue(DictationShortcut.shouldStopOnRelease(elapsed: 1.1, state: .preparing))
+        // Releases after the session already advanced are not another toggle.
+        XCTAssertFalse(DictationShortcut.shouldStopOnRelease(elapsed: 0.6, state: .processing))
+        XCTAssertFalse(DictationShortcut.shouldStopOnRelease(elapsed: 0.6, state: .idle))
+    }
+
     func testMultilingualScoringPreservesNumbersAndAccents() {
         XCTAssertEqual(DictationScoring.words("Hello, ROMÂNĂ 649!"), ["hello", "română", "649"])
         XCTAssertEqual(DictationScoring.wordErrorRate(reference: "Bună ziua!", hypothesis: "bună ziua"), 0)
@@ -69,7 +80,7 @@ final class DictationTests: XCTestCase {
         XCTAssertFalse(audio.isFull)
         audio.clear()
         XCTAssertTrue(try audio.snapshot().isEmpty)
-        XCTAssertEqual(DictationAudio.maximumSamples, 60 * 16_000)
+        XCTAssertEqual(DictationAudio.maximumSamples, Config.dictationMaximumSeconds() * 16_000)
     }
 
     func testAudioConversionAndSnapshotsAreIndependent() throws {
@@ -103,7 +114,7 @@ final class DictationTests: XCTestCase {
         for index in 0..<16_000 { channel[index] = 0 }
         let audio = DictationAudio()
         try audio.configure(inputFormat: format)
-        for _ in 0..<65 { audio.append(buffer) }
+        for _ in 0..<(Config.dictationMaximumSeconds() + 1) { audio.append(buffer) }
         XCTAssertTrue(audio.isFull)
         XCTAssertEqual(try audio.snapshot().count, DictationAudio.maximumSamples)
     }

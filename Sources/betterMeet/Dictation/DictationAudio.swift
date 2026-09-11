@@ -5,7 +5,7 @@ import Synchronization
 /// Bounded PCM storage shared by the audio callback and recognition snapshots.
 final class DictationAudio: Sendable {
     static let sampleRate = 16_000.0
-    static let maximumSamples = 60 * 16_000
+    static let maximumSamples = Config.dictationMaximumSeconds() * 16_000
     private struct State {
         var samples: [Float] = []
         var converter: AVAudioConverter?

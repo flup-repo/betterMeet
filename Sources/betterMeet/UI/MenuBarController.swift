@@ -1,6 +1,16 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// F9 starts dictation and a second press stops it. Holding F9 long enough
+/// behaves as push-to-talk: releasing it stops dictation.
+enum DictationShortcut {
+    static let holdThreshold: TimeInterval = 1.0
+
+    static func shouldStopOnRelease(elapsed: TimeInterval, state: DictationState) -> Bool {
+        elapsed >= holdThreshold && (state == .listening || state == .preparing)
+    }
+}
+
 /// Status bar item in the top-right of the menu bar. The icon shows closed
 /// eyes while idle and open eyes while recording so the capture state is
 /// visible at a glance. The menu provides the daemon's only persistent control
@@ -20,6 +30,7 @@ final class MenuBarController {
     private var elapsed: String?
     private var dictation = DictationState.idle
     private var heldHotKeys: Set<UInt32> = []
+    private var dictationKeyPressDate: Date?
     private var dictationShortcutAvailable = true
 
     var onToggle: (() -> Void)? {
@@ -259,6 +270,7 @@ final class MenuBarController {
               id.signature == 0x716C6C72 else { return OSStatus(eventNotHandledErr) }
         if GetEventKind(event) == UInt32(kEventHotKeyReleased) {
             controller.heldHotKeys.remove(id.id)
+            if id.id == 2 { controller.handleDictationRelease() }
             return noErr
         }
         guard controller.heldHotKeys.insert(id.id).inserted else { return noErr }
@@ -266,10 +278,33 @@ final class MenuBarController {
         case 1:
             if !controller.dictation.isBusy { controller.onToggle?() }
         case 2:
-            if !controller.recording { controller.onDictation?() }
+            controller.handleDictationPress()
         default: return OSStatus(eventNotHandledErr)
         }
         return noErr
+    }
+
+    private func handleDictationPress() {
+        FileHandle.standardError.write(Data("dictation hotkey press state=\(dictation)\n".utf8))
+        if dictation.isBusy {
+            // A second press stops the current dictation; the matching release
+            // must not toggle it again.
+            dictationKeyPressDate = nil
+            onDictation?()
+        } else {
+            dictationKeyPressDate = Date()
+            if !recording { onDictation?() }
+        }
+    }
+
+    private func handleDictationRelease() {
+        defer { dictationKeyPressDate = nil }
+        guard let pressedAt = dictationKeyPressDate else { return }
+        let elapsed = Date().timeIntervalSince(pressedAt)
+        FileHandle.standardError.write(Data("dictation hotkey release elapsed=\(elapsed)\n".utf8))
+        if DictationShortcut.shouldStopOnRelease(elapsed: elapsed, state: dictation) {
+            onDictation?()
+        }
     }
 
     @objc private func toggleClicked() { onToggle?() }

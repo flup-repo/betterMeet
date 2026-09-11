@@ -10,7 +10,7 @@ struct DictationDestination {
     let pid: pid_t
     let window: AXUIElement
     let element: AXUIElement?
-    let textState: DictationTextState
+    var textState: DictationTextState
     let bundleID: String
 
     static func capture() -> DictationDestination? {
@@ -45,7 +45,22 @@ struct DictationDestination {
         rejectionReason() == nil
     }
 
+    /// Same focus/window/field checks as `rejectionReason()`, but without
+    /// requiring the text to be untouched. Live preview intentionally changes
+    /// the field value while dictation is running.
+    func focusUnchanged() -> Bool {
+        focusRejectionReason() == nil
+    }
+
     func rejectionReason() -> String? {
+        if let reason = focusRejectionReason() { return reason }
+        let focused = Self.elementAttribute(Self.applicationElement(pid: pid), kAXFocusedUIElementAttribute)
+        return textState.matches(Self.readTextState(focused)) ? nil : "text_or_selection_changed"
+    }
+
+    /// Focus/window/field checks only, deliberately excluding text changes
+    /// caused by the live preview itself.
+    func focusRejectionReason() -> String? {
         guard AXIsProcessTrusted() else { return "permission_denied" }
         guard !IsSecureEventInputEnabled() else { return "secure_input" }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return "app_changed" }
@@ -57,7 +72,101 @@ struct DictationDestination {
         if let element {
             guard let focused, CFEqual(element, focused) else { return "field_changed" }
         }
-        return textState.matches(Self.readTextState(focused)) ? nil : "text_or_selection_changed"
+        return nil
+    }
+
+    /// Replace `range` in the field with `text`, preferring a full value write
+    /// and falling back to selection replacement. Returns true only when the
+    /// editor reflects the new value back.
+    mutating func replace(range: CFRange, with text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        if let value = textState.value,
+           let expected = Self.replacement(in: value, range: range, text: text),
+           writeValue(expected) {
+            return true
+        }
+        return replaceSelection(range: range, with: text)
+    }
+
+    /// Write the full field value when selection replacement is not honored.
+    /// Returns true only when the editor reflects the new value back.
+    mutating func writeValue(_ text: String) -> Bool {
+        guard let element, !text.isEmpty else { return false }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+              settable.boolValue,
+              AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFString) == .success else {
+            return false
+        }
+        let current = Self.string(element, kAXValueAttribute)
+        guard current == text else { return false }
+        textState.value = text
+        if let selection = textState.selection {
+            textState.selection = .init(location: selection.location + text.utf16.count, length: 0)
+        }
+        return true
+    }
+
+    /// Replace the selected range with `text` using Accessibility. Returns
+    /// false when the editor does not allow selecting or replacing text.
+    func replaceSelection(range: CFRange, with text: String) -> Bool {
+        guard let element, !text.isEmpty else { return false }
+        var rangeSettable = DarwinBoolean(false)
+        var textSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &rangeSettable) == .success,
+              rangeSettable.boolValue,
+              AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &textSettable) == .success,
+              textSettable.boolValue else { return false }
+        var value = range
+        if range.length > 0 || range.location > 0 {
+            guard let axRange = AXValueCreate(.cfRange, &value) else { return false }
+            guard AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange) == .success else {
+                return false
+            }
+        }
+        let wrote = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString)
+        guard wrote == .success else { return false }
+        // Collapse the selection to the end of the inserted text so the editor
+        // does not leave the previous preview visually selected.
+        var collapsed = CFRange(location: range.location + text.utf16.count, length: 0)
+        if let collapsedValue = AXValueCreate(.cfRange, &collapsed) {
+            _ = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, collapsedValue)
+        }
+        return true
+    }
+
+    /// Insert text by typing it through real keyboard events. This avoids
+    /// selection-based AX writes that some editors render as a selection.
+    func type(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        guard let source = CGEventSource(stateID: .privateState) else { return false }
+        for scalar in text.unicodeScalars {
+            let units = Array(String(scalar).utf16)
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return false }
+            down.flags = []
+            up.flags = []
+            down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+            up.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+            down.postToPid(pid)
+            up.postToPid(pid)
+        }
+        return true
+    }
+
+    /// Delete the previous typed preview so the final text can replace it.
+    func deleteBackward(_ count: Int) -> Bool {
+        guard count > 0,
+              let source = CGEventSource(stateID: .privateState) else { return false }
+        for _ in 0..<count {
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: false) else { return false }
+            down.flags = []
+            up.flags = []
+            down.postToPid(pid)
+            up.postToPid(pid)
+        }
+        return true
     }
 
     /// Prefer targeted AX replacement. Editors that reject it can accept a
@@ -150,7 +259,14 @@ struct DictationDestination {
     private static func readTextState(_ element: AXUIElement?) -> DictationTextState {
         guard let element else { return DictationTextState() }
         let range = selectedRange(element)
-        return DictationTextState(value: string(element, kAXValueAttribute),
+        let value = string(element, kAXValueAttribute)
+        let placeholder = string(element, "AXPlaceholderValue")
+        // Placeholder text is not user content. Treat it as an empty field so
+        // dictation replaces it instead of appending after the placeholder.
+        if let value, let placeholder, value == placeholder {
+            return DictationTextState(value: "", selection: .init(location: 0, length: 0))
+        }
+        return DictationTextState(value: value,
                                   selection: range.map { .init(location: $0.location, length: $0.length) })
     }
 
