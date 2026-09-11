@@ -1,6 +1,16 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// F9 starts dictation and a second press stops it. Holding F9 long enough
+/// behaves as push-to-talk: releasing it stops dictation.
+enum DictationShortcut {
+    static let holdThreshold: TimeInterval = 1.0
+
+    static func shouldStopOnRelease(elapsed: TimeInterval, state: DictationState) -> Bool {
+        elapsed >= holdThreshold && (state == .listening || state == .preparing)
+    }
+}
+
 /// Status bar item in the top-right of the menu bar. The icon shows closed
 /// eyes while idle and open eyes while recording so the capture state is
 /// visible at a glance. The menu provides the daemon's only persistent control
@@ -11,12 +21,23 @@ final class MenuBarController {
     private let stateLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
     private let toggleItem: NSMenuItem
+    private let dictationItem: NSMenuItem
+    private let cancelDictationItem: NSMenuItem
     private var hotKeyRef: EventHotKeyRef?
+    private var dictationHotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
+    private var recording = false
+    private var elapsed: String?
+    private var dictation = DictationState.idle
+    private var heldHotKeys: Set<UInt32> = []
+    private var dictationKeyPressDate: Date?
+    private var dictationShortcutAvailable = true
 
     var onToggle: (() -> Void)? {
-        didSet { toggleItem.isEnabled = onToggle != nil }
+        didSet { refresh() }
     }
+    var onDictation: (() -> Void)? { didSet { refresh() } }
+    var onCancelDictation: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
 
@@ -46,6 +67,18 @@ final class MenuBarController {
         toggleItem.isEnabled = false
         menu.addItem(toggleItem)
 
+        dictationItem = NSMenuItem(
+            title: "Start dictation", action: #selector(dictationClicked),
+            keyEquivalent: String(UnicodeScalar(NSF9FunctionKey)!)
+        )
+        dictationItem.keyEquivalentModifierMask = []
+        dictationItem.isEnabled = false
+        menu.addItem(dictationItem)
+        cancelDictationItem = NSMenuItem(title: "Cancel dictation", action: #selector(cancelDictationClicked),
+                                        keyEquivalent: "")
+        cancelDictationItem.isHidden = true
+        menu.addItem(cancelDictationItem)
+
         let openFolder = NSMenuItem(
             title: "Open recordings folder",
             action: #selector(openFolderClicked),
@@ -62,7 +95,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openFolder, quit] {
+        for item in [toggleItem, dictationItem, cancelDictationItem, openFolder, quit] {
             item.target = self
         }
 
@@ -79,15 +112,14 @@ final class MenuBarController {
     /// Register the shortcut with macOS rather than relying on the menu item's
     /// key equivalent, which is only evaluated while the menu is active.
     private func installGlobalShortcut() {
-        var eventSpec = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
+        var eventSpecs = [kEventHotKeyPressed, kEventHotKeyReleased].map {
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32($0))
+        }
         let handlerStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             Self.hotKeyHandler,
-            1,
-            &eventSpec,
+            2,
+            &eventSpecs,
             Unmanaged.passUnretained(self).toOpaque(),
             &eventHandlerRef
         )
@@ -108,11 +140,18 @@ final class MenuBarController {
             &hotKeyRef
         )
         if hotKeyStatus != noErr {
-            RemoveEventHandler(eventHandlerRef)
-            eventHandlerRef = nil
             FileHandle.standardError.write(Data(
                 "warning: couldn't register Control + Option + R (\(hotKeyStatus))\n".utf8
             ))
+        }
+        let dictationStatus = RegisterEventHotKey(
+            UInt32(kVK_F9), 0, EventHotKeyID(signature: 0x716C6C72, id: 2),
+            GetApplicationEventTarget(), 0, &dictationHotKeyRef
+        )
+        if dictationStatus != noErr {
+            dictationShortcutAvailable = false
+            refresh()
+            FileHandle.standardError.write(Data("warning: couldn't register F9 (\(dictationStatus))\n".utf8))
         }
     }
 
@@ -120,6 +159,10 @@ final class MenuBarController {
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
             self.hotKeyRef = nil
+        }
+        if let dictationHotKeyRef {
+            UnregisterEventHotKey(dictationHotKeyRef)
+            self.dictationHotKeyRef = nil
         }
         if let eventHandlerRef {
             RemoveEventHandler(eventHandlerRef)
@@ -131,10 +174,33 @@ final class MenuBarController {
     /// icon (open eyes while recording, closed eyes when idle). Call once a
     /// second while recording.
     func update(recording: Bool, elapsed: String?) {
-        stateLabel.title = recording ? "● recording · \(elapsed ?? "0:00")" : "idle"
+        self.recording = recording
+        self.elapsed = elapsed
+        refresh()
+    }
+
+    func updateDictation(_ state: DictationState) {
+        dictation = state
+        refresh()
+    }
+
+    private func refresh() {
+        stateLabel.title = dictation.isBusy ? dictation.label :
+            (recording ? "● recording · \(elapsed ?? "0:00")" : "idle")
         toggleItem.title = recording ? "Stop recording" : "Start recording"
+        toggleItem.isEnabled = onToggle != nil && !dictation.isBusy
+        switch dictation {
+        case .idle: dictationItem.title = dictationShortcutAvailable ? "Start dictation" : "Start dictation (F9 unavailable)"
+        case .preparing: dictationItem.title = "Cancel preparing dictation"
+        case .listening: dictationItem.title = "Stop dictation"
+        case .processing: dictationItem.title = "Processing dictation…"
+        case .inserting: dictationItem.title = "Inserting dictation…"
+        }
+        dictationItem.isEnabled = onDictation != nil && !recording && dictation != .processing && dictation != .inserting
+        cancelDictationItem.isHidden = !dictation.isBusy
+        cancelDictationItem.isEnabled = dictation.canCancel
         if let button = statusItem.button {
-            button.image = recording ? Self.eyesOpenImage() : Self.eyesClosedImage()
+            button.image = recording || dictation.isBusy ? Self.eyesOpenImage() : Self.eyesClosedImage()
         }
     }
 
@@ -192,16 +258,58 @@ final class MenuBarController {
         return image
     }
 
-    private static let hotKeyHandler: EventHandlerUPP = { _, _, userData in
-        guard let userData else { return noErr }
+    private static let hotKeyHandler: EventHandlerUPP = { _, event, userData in
+        guard let userData, let event else { return OSStatus(eventNotHandledErr) }
         let controller = Unmanaged<MenuBarController>
             .fromOpaque(userData)
             .takeUnretainedValue()
-        controller.onToggle?()
+        var id = EventHotKeyID()
+        guard GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                                EventParamType(typeEventHotKeyID), nil,
+                                MemoryLayout<EventHotKeyID>.size, nil, &id) == noErr,
+              id.signature == 0x716C6C72 else { return OSStatus(eventNotHandledErr) }
+        if GetEventKind(event) == UInt32(kEventHotKeyReleased) {
+            controller.heldHotKeys.remove(id.id)
+            if id.id == 2 { controller.handleDictationRelease() }
+            return noErr
+        }
+        guard controller.heldHotKeys.insert(id.id).inserted else { return noErr }
+        switch id.id {
+        case 1:
+            if !controller.dictation.isBusy { controller.onToggle?() }
+        case 2:
+            controller.handleDictationPress()
+        default: return OSStatus(eventNotHandledErr)
+        }
         return noErr
     }
 
+    private func handleDictationPress() {
+        FileHandle.standardError.write(Data("dictation hotkey press state=\(dictation)\n".utf8))
+        if dictation.isBusy {
+            // A second press stops the current dictation; the matching release
+            // must not toggle it again.
+            dictationKeyPressDate = nil
+            onDictation?()
+        } else {
+            dictationKeyPressDate = Date()
+            if !recording { onDictation?() }
+        }
+    }
+
+    private func handleDictationRelease() {
+        defer { dictationKeyPressDate = nil }
+        guard let pressedAt = dictationKeyPressDate else { return }
+        let elapsed = Date().timeIntervalSince(pressedAt)
+        FileHandle.standardError.write(Data("dictation hotkey release elapsed=\(elapsed)\n".utf8))
+        if DictationShortcut.shouldStopOnRelease(elapsed: elapsed, state: dictation) {
+            onDictation?()
+        }
+    }
+
     @objc private func toggleClicked() { onToggle?() }
+    @objc private func dictationClicked() { onDictation?() }
+    @objc private func cancelDictationClicked() { onCancelDictation?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
     @objc private func quitClicked() { onQuit?() }
 }

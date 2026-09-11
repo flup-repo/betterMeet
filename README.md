@@ -1,7 +1,9 @@
-# betterMeet
+# betterMeet - Dictation and Live Meeting Transcription
 
-A macOS menu-bar app that records your microphone and system audio separately,
-then transcribes them locally. Model weights download on first use.
+A macOS menu-bar app that transcribes live meetings and offers live dictate functionality. 
+For meetings, it records your microphone and system audio separately,
+then transcribes them locally. 
+Model weights download on first use.
 
 Requires macOS 15+ and Swift 6 to build. Apple Silicon is recommended.
 
@@ -40,6 +42,38 @@ Recordings are saved under `~/Recordings/`. Each session contains:
 The labels identify tracks, not individual people. Check JSON for track errors
 if the transcript reports `partial` or `failed`.
 
+## Dictate into a text field
+
+Put the cursor in the destination text field in any app. The text is automatically
+inserted at the cursor position using live-preview.
+If automatic insertion does not work, the recognized text is copied to the
+clipboard so you can paste it manually.
+
+Holding **F9** works as push-to-talk: dictation runs while the key is held and
+stops when it is released. A short press keeps dictation running until the next
+short press, as before.
+
+Dictation always uses multilingual **Parakeet v3**, with automatic language
+recognition across its 25 supported European languages.
+
+### Measure dictation speed and accuracy
+
+Use a real recording of up to 60 seconds and a manually checked reference:
+
+```sh
+/usr/local/bin/betterMeet dictation-benchmark /absolute/path/sample.wav \
+  --reference /absolute/path/reference.txt --runs 3 \
+  --output /absolute/path/new-result.json
+```
+
+This uses the same multilingual recognition path as F9 without capturing the
+microphone, inserting text, or running hooks. It reports model preparation time,
+warm recognition times (including worker communication), and word error rate
+with punctuation/case ignored. The optional output file must be new and includes
+recognized text; stdout contains only metrics. These timings exclude microphone
+startup, live preview already in flight, and insertion. The menu bar reports
+the current state during interactive dictation.
+
 ## Settings
 
 Configuration is optional. These are the defaults; merge changes into
@@ -48,6 +82,7 @@ Configuration is optional. These are the defaults; merge changes into
 ```json
 {
   "mic_voice_processing": false,
+  "dictation_max_seconds": 600,
   "transcription": {
     "model": "v3",
     "speech_detection": "annotate"
@@ -57,6 +92,8 @@ Configuration is optional. These are the defaults; merge changes into
 
 - `v3` supports multilingual transcription; `v2` is English-only. Neither
   translates speech into English.
+- `dictation_max_seconds` caps live dictation audio kept in memory. The default
+  is 600 seconds (10 minutes).
 - `annotate` flags suspicious audio without removing words. `off` disables speech
   detection; experimental `filter` excludes non-speech spans from the readable
   transcript while retaining them in JSON.

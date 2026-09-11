@@ -33,6 +33,13 @@ enum Config {
         return cmd
     }
 
+    /// Maximum dictation audio to keep in memory, in seconds. Defaults to 10
+    /// minutes so long dictation is practical without unbounded memory.
+    static func dictationMaximumSeconds() -> Int {
+        guard let seconds = load()?["dictation_max_seconds"] as? Int, seconds > 0 else { return 600 }
+        return seconds
+    }
+
     /// Whether finished recordings are transcribed automatically. Default on.
     static func transcriptionEnabled() -> Bool {
         transcription()?["enabled"] as? Bool ?? true

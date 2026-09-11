@@ -59,9 +59,6 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     func transcribe(_ audio: URL) async throws -> TrackTranscription {
-        guard let manager else { throw EngineError.notPrepared }
-        let began = Date()
-
         // A track with no frames (recorder died before its first buffer)
         // makes AVFoundation raise an ObjC exception deep inside the
         // resampler — uncatchable from Swift, so it takes the whole daemon
@@ -80,6 +77,16 @@ actor ParakeetEngine: TranscriptionEngine {
         guard !samples.isEmpty, samples.allSatisfy(\.isFinite) else {
             throw EngineError.unreadableAudio(audio, nil)
         }
+        return try await transcribe(samples: samples)
+    }
+
+    /// Dictation supplies mono 16 kHz PCM directly, without temporary recordings.
+    func transcribe(samples: [Float]) async throws -> TrackTranscription {
+        guard let manager else { throw EngineError.notPrepared }
+        guard !samples.isEmpty, samples.allSatisfy(\.isFinite) else {
+            throw TranscriptionFailure("invalid audio samples")
+        }
+        let began = Date()
         let duration = Double(samples.count) / 16_000
         var state = try TdtDecoderState()
         let result = try await manager.transcribe(samples, decoderState: &state)
