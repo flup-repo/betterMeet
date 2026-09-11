@@ -113,6 +113,7 @@ actor TranscriptionCoordinator {
                     to: dir.appendingPathComponent(".complete"),
                     options: .atomic
                 )
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent("transcribe.log"))
                 notifyUser(title: "betterMeet — transcript ready", body: dir.lastPathComponent)
             } catch {
                 log(dir, "transcription failed: \(error)")
@@ -135,8 +136,8 @@ actor TranscriptionCoordinator {
         let document = try await TranscriptionWorker.transcribe(
             source: dir, output: dir, settings: Config.transcriptionSettings()
         )
-        log(dir, "\(document.status) — \(document.segments.count) segments")
         guard document.status == "complete" else {
+            log(dir, "\(document.status) — \(document.segments.count) segments")
             throw TranscriptionFailure("incomplete transcription; successful tracks saved, see transcript.json")
         }
     }

@@ -132,7 +132,17 @@ enum TranscriptionJob {
         let document = try document(source: source, settings: settings, reports: reports,
                                     processingSeconds: Date().timeIntervalSince(began))
         try document.write(to: output)
+        cleanupSuccessfulOutput(document, in: output)
         return document
+    }
+
+    static func cleanupSuccessfulOutput(_ document: TranscriptDocument, in output: URL) {
+        guard document.status == "complete" else { return }
+        // Retry data is redundant only after both final transcripts are saved.
+        // Leave the lock file in place: unlinking it can bypass an active flock.
+        for name in [".transcription-me.json", ".transcription-them.json", "transcribe.log"] {
+            try? FileManager.default.removeItem(at: output.appendingPathComponent(name))
+        }
     }
 
     static func document(source: URL, settings: TranscriptionSettings, reports: [TrackReport],

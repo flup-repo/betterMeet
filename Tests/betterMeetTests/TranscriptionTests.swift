@@ -148,7 +148,7 @@ final class TranscriptionTests: XCTestCase {
             sourceBytes: values.fileSize, sourceModified: values.contentModificationDate,
             result: TrackTranscription(duration: 1, processingSeconds: 0, rawText: "Saved.",
                                        segments: [TranscriptSegment(start: 0, end: 1, text: "Saved.")]),
-            error: nil, warnings: []
+            error: nil, warnings: ["fixture coverage warning"]
         )
         let checkpoint = TranscriptionJob.Checkpoint(
             schemaVersion: 1, source: root.path, settings: TranscriptionSettings(), report: savedReport
@@ -157,6 +157,7 @@ final class TranscriptionTests: XCTestCase {
         let data = try JSONEncoder().encode(checkpoint)
         try data.write(to: checkpointURL)
         let doc = try await TranscriptionJob.run(source: root, output: root, settings: TranscriptionSettings())
+        XCTAssertEqual(doc.status, "partial")
         XCTAssertEqual(doc.segments.first?.text, "Saved.")
         XCTAssertEqual(try Data(contentsOf: checkpointURL), data)
         try Data("changed cache identity fixture".utf8).write(to: file)
@@ -165,6 +166,64 @@ final class TranscriptionTests: XCTestCase {
             XCTFail("changed source must not replace a successful checkpoint")
         } catch {
             XCTAssertEqual(try Data(contentsOf: checkpointURL), data)
+        }
+    }
+
+    func testSuccessfulJobSavesTranscriptsBeforeRemovingCheckpoint() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"schema_version":2,"files":{"mic":"mic.aac"},"start_offset_ms":{"mic":62}}"#.utf8)
+            .write(to: root.appendingPathComponent("meta.json"))
+        let result = TrackTranscription(duration: 1, processingSeconds: 0, rawText: "Saved.",
+                                        segments: [TranscriptSegment(start: 0, end: 1, text: "Saved.")])
+        let checkpoint = TranscriptionJob.Checkpoint(
+            schemaVersion: 1, source: root.path, settings: TranscriptionSettings(), report: report(result: result)
+        )
+        let checkpointURL = root.appendingPathComponent(".transcription-me.json")
+        try JSONEncoder().encode(checkpoint).write(to: checkpointURL)
+        try Data("previous failure".utf8).write(to: root.appendingPathComponent("transcribe.log"))
+        let doc = try await TranscriptionJob.run(source: root, output: root, settings: TranscriptionSettings())
+        XCTAssertEqual(doc.status, "complete")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: checkpointURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("transcribe.log").path))
+        let saved = try JSONDecoder().decode(
+            TranscriptDocument.self, from: Data(contentsOf: root.appendingPathComponent("transcript.json"))
+        )
+        XCTAssertEqual(saved.segments.first?.text, "Saved.")
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("transcript.md"), encoding: .utf8),
+                       doc.rendered())
+    }
+
+    func testCleanupOnlyRemovesSuccessfulTranscriptionArtifacts() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let disposable = [".transcription-me.json", ".transcription-them.json", "transcribe.log"]
+        let retained = [".transcription.lock", ".transcribed", ".complete", "meta.json",
+                        "mic.aac", "system.aac", "transcript.json", "transcript.md", "unrelated.txt"]
+        let fixture = Data("fixture".utf8)
+        for name in disposable + retained {
+            try fixture.write(to: root.appendingPathComponent(name))
+        }
+        let good = report(result: TrackTranscription(duration: 1, processingSeconds: 0,
+                                                     rawText: "", segments: []))
+        let bad = report(result: nil)
+        for reports in [[bad], [good, bad]] {
+            let doc = try TranscriptionJob.document(source: root, settings: TranscriptionSettings(),
+                                                   reports: reports, processingSeconds: 0)
+            TranscriptionJob.cleanupSuccessfulOutput(doc, in: root)
+            for name in disposable + retained {
+                XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), fixture)
+            }
+        }
+        let doc = try TranscriptionJob.document(source: root, settings: TranscriptionSettings(),
+                                               reports: [good], processingSeconds: 0)
+        TranscriptionJob.cleanupSuccessfulOutput(doc, in: root)
+        TranscriptionJob.cleanupSuccessfulOutput(doc, in: root)
+        for name in disposable {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path))
+        }
+        for name in retained {
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), fixture)
         }
     }
 
