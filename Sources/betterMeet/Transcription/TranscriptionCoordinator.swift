@@ -133,8 +133,11 @@ actor TranscriptionCoordinator {
     }
 
     private func transcribe(_ dir: URL) async throws {
-        let document = try await TranscriptionWorker.transcribe(
-            source: dir, output: dir, settings: Config.transcriptionSettings()
+        _ = try await InferenceService.shared.request(InferenceRequest(
+            operation: .meeting, source: dir, output: dir, settings: Config.transcriptionSettings()
+        ))
+        let document = try JSONDecoder().decode(
+            TranscriptDocument.self, from: Data(contentsOf: dir.appendingPathComponent("transcript.json"))
         )
         guard document.status == "complete" else {
             log(dir, "\(document.status) — \(document.segments.count) segments")

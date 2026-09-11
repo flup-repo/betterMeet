@@ -67,13 +67,14 @@ enum TranscriptionJob {
         let report: TrackReport
     }
 
-    static func run(source: URL, output: URL, settings: TranscriptionSettings) async throws -> TranscriptDocument {
+    static func run(source: URL, output: URL, settings: TranscriptionSettings,
+                    preparedEngine: ParakeetEngine? = nil) async throws -> TranscriptDocument {
         let source = source.resolvingSymlinksInPath().standardizedFileURL
         let meta = try SessionMeta.read(from: source)
         var settings = settings
         try settings.resolveVocabulary()
         let began = Date()
-        let engine = ParakeetEngine(settings: settings)
+        let engine = preparedEngine ?? ParakeetEngine(settings: settings)
         var reports: [TrackReport] = []
         do {
             for track in meta.tracks {
@@ -125,10 +126,10 @@ enum TranscriptionJob {
                 }
             }
         } catch {
-            await engine.release()
+            if preparedEngine == nil { await engine.release() }
             throw error
         }
-        await engine.release()
+        if preparedEngine == nil { await engine.release() }
         let document = try document(source: source, settings: settings, reports: reports,
                                     processingSeconds: Date().timeIntervalSince(began))
         try document.write(to: output)

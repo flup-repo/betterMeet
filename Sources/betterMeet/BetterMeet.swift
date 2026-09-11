@@ -7,13 +7,15 @@ struct BetterMeet: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "betterMeet",
         abstract: "Local meeting recorder + transcriber. Records mic and system audio as two tracks, then transcribes on-device.",
-        subcommands: [Run.self, Doctor.self, Install.self, Transcribe.self, TranscriptionWorker.self],
+        subcommands: [Run.self, Doctor.self, Install.self, Transcribe.self, TranscriptionWorker.self,
+                      InferenceWorker.self, DictationBenchmark.self],
         defaultSubcommand: Run.self
     )
 
     /// Keep AppKit's entrypoint synchronous. Only headless commands enter the
     /// Swift async runtime; blocking NSApplication.run inside it starves UI tasks.
     static func main() {
+        signal(SIGPIPE, SIG_IGN)
         do {
             var command = try parseAsRoot()
             if let asynchronous = command as? any AsyncParsableCommand {
@@ -107,6 +109,7 @@ final class AppController {
     private let root: URL
     private let menuBar = MenuBarController()
     private let transcription = TranscriptionCoordinator()
+    private let dictation = DictationController()
     private var session: RecordingSession?
     private var ticker: Timer?
     private var shuttingDown = false
@@ -116,6 +119,12 @@ final class AppController {
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.update(recording: false, elapsed: nil)
+        dictation.onState = { [weak self] state in self?.menuBar.updateDictation(state) }
+        menuBar.onDictation = { [weak self] in
+            guard let self, !self.shuttingDown, self.session == nil else { return }
+            self.dictation.toggle()
+        }
+        menuBar.onCancelDictation = { [weak self] in self?.dictation.cancel() }
 
         Task { [transcription, root] in
             await transcription.setStatusHandler { status in
@@ -135,12 +144,14 @@ final class AppController {
     func shutdown() {
         guard !shuttingDown else { return }
         shuttingDown = true
+        dictation.cancel()
         let pendingSession = stopSession(enqueue: false)
         menuBar.shutdown()
         Task { [transcription] in
             if let pendingSession {
                 await transcription.enqueue(pendingSession)
             }
+            await InferenceService.shared.shutdown()
             await MainActor.run {
                 NSApp.terminate(nil)
             }
@@ -148,6 +159,7 @@ final class AppController {
     }
 
     private func toggle() {
+        guard !shuttingDown, !dictation.state.isBusy else { return }
         if session == nil {
             startSession()
         } else {

@@ -40,6 +40,36 @@ Recordings are saved under `~/Recordings/`. Each session contains:
 The labels identify tracks, not individual people. Check JSON for track errors
 if the transcript reports `partial` or `failed`.
 
+## Dictate into a text field
+
+1. Put the cursor in the destination text field.
+2. Press **F9**, or choose **Start dictation** in the menu.
+3. Wait for **Listening**, then speak. The floating panel shows a provisional
+   transcript that can change as more context arrives.
+4. Press **F9** again, or choose **Stop dictation**. The app finalizes the
+   transcript and inserts it into supported text fields.
+
+Dictation always uses multilingual **Parakeet v3**, with automatic language
+recognition across its 25 supported European languages.
+
+### Measure dictation speed and accuracy
+
+Use a real recording of up to 60 seconds and a manually checked reference:
+
+```sh
+/usr/local/bin/betterMeet dictation-benchmark /absolute/path/sample.wav \
+  --reference /absolute/path/reference.txt --runs 3 \
+  --output /absolute/path/new-result.json
+```
+
+This uses the same multilingual recognition path as F9 without capturing the
+microphone, inserting text, or running hooks. It reports model preparation time,
+warm recognition times (including worker communication), and word error rate
+with punctuation/case ignored. The optional output file must be new and includes
+recognized text; stdout contains only metrics. These timings exclude microphone
+startup, preview already in flight, and insertion. The panel reports the actual
+stop-to-result time during interactive dictation.
+
 ## Settings
 
 Configuration is optional. These are the defaults; merge changes into
