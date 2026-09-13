@@ -3,7 +3,7 @@ import AVFoundation
 import FluidAudio
 import Foundation
 
-/// The same in-memory, multilingual recognition path as F9. No insertion or hooks.
+/// The same in-memory, multilingual recognition path as the Right ⌥ dictation. No insertion or hooks.
 struct DictationBenchmark: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dictation-benchmark",

@@ -49,9 +49,10 @@ inserted at the cursor position using live-preview.
 If automatic insertion does not work, the recognized text is copied to the
 clipboard so you can paste it manually.
 
-Holding **F9** works as push-to-talk: dictation runs while the key is held and
-stops when it is released. A short press keeps dictation running until the next
-short press, as before.
+Holding **Right ⌥** works as push-to-talk: dictation runs while the key is
+held and stops when it is released. A short press keeps dictation running
+until the next short press, as before. The key is fully dedicated to
+dictation; the left Option key keeps its normal behavior.
 
 Dictation always uses multilingual **Parakeet v3**, with automatic language
 recognition across its 25 supported European languages.
@@ -66,7 +67,8 @@ Use a real recording of up to 60 seconds and a manually checked reference:
   --output /absolute/path/new-result.json
 ```
 
-This uses the same multilingual recognition path as F9 without capturing the
+This uses the same multilingual recognition path as the Right ⌥ dictation
+without capturing the
 microphone, inserting text, or running hooks. It reports model preparation time,
 warm recognition times (including worker communication), and word error rate
 with punctuation/case ignored. The optional output file must be new and includes

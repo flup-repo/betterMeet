@@ -12,7 +12,7 @@ enum DictationState: Equatable {
         switch self {
         case .idle: return "idle"
         case .preparing: return "preparing dictation…"
-        case .listening: return "dictating · F9 to finish"
+        case .listening: return "dictating · Right ⌥ to finish"
         case .processing: return "processing dictation…"
         case .inserting: return "inserting dictation…"
         }
@@ -21,7 +21,7 @@ enum DictationState: Equatable {
 
 enum DictationInputPolicy {
     static func invalidatesDestination(type: NSEvent.EventType, keyCode: UInt16) -> Bool {
-        type != .keyDown || keyCode != UInt16(kVK_F9)
+        type != .keyDown || keyCode != UInt16(kVK_RightOption)
     }
 }
 

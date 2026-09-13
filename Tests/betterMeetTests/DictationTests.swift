@@ -193,8 +193,8 @@ final class DictationTests: XCTestCase {
         XCTAssertFalse(original.confirmsInsertion(" text", currentValue: " textDraft"))
     }
 
-    func testTypingOrClickingInvalidatesDestinationButF9DoesNot() {
-        XCTAssertFalse(DictationInputPolicy.invalidatesDestination(type: .keyDown, keyCode: UInt16(kVK_F9)))
+    func testTypingOrClickingInvalidatesDestinationButRightOptionDoesNot() {
+        XCTAssertFalse(DictationInputPolicy.invalidatesDestination(type: .keyDown, keyCode: UInt16(kVK_RightOption)))
         XCTAssertTrue(DictationInputPolicy.invalidatesDestination(type: .keyDown, keyCode: UInt16(kVK_ANSI_A)))
         XCTAssertTrue(DictationInputPolicy.invalidatesDestination(type: .leftMouseDown, keyCode: 0))
         XCTAssertTrue(DictationInputPolicy.invalidatesDestination(type: .rightMouseDown, keyCode: 0))
