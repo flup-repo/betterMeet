@@ -44,6 +44,9 @@ final class SystemAudioRecorder {
     private(set) var firstBufferAt: Date?
     /// Host time for the first frame, shared with AVAudioEngine's clock.
     private(set) var firstBufferHostTime: UInt64?
+    /// Wall-clock time of the most recent buffer with audible signal. Written
+    /// from the IO proc, read from main by the auto-stop logic.
+    private(set) var lastActivityAt: Date?
 
     /// Start capturing system audio as an ADTS AAC stream. Each packet is
     /// independently framed, so audio remains readable after an unclean exit.
@@ -158,6 +161,9 @@ final class SystemAudioRecorder {
             ) else { return }
             do {
                 try file.write(from: buffer)
+                if Self.peak(of: buffer) > MicRecorder.activityThreshold {
+                    self.lastActivityAt = Date()
+                }
             } catch {
                 self.reportFailure(RecorderError.writeFailed(error))
             }
@@ -166,6 +172,19 @@ final class SystemAudioRecorder {
 
         status = AudioDeviceStart(aggregateID, procID)
         guard status == noErr else { throw RecorderError.deviceStartFailed(status) }
+    }
+
+    /// Peak amplitude across all float channels, or 0 if the format isn't
+    /// float (the tap always delivers float32).
+    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData else { return 0 }
+        var peak: Float = 0
+        for channel in 0..<Int(buffer.format.channelCount) {
+            for i in 0..<Int(buffer.frameLength) {
+                peak = max(peak, abs(data[channel][i]))
+            }
+        }
+        return peak
     }
 
     private func reportFailure(_ error: Error) {

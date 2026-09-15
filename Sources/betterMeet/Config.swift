@@ -6,6 +6,8 @@ import Foundation
 ///       "recordings_dir": "~/Recordings",
 ///       "transcription": { "enabled": true, "engine": "parakeet" },
 ///       "mic_voice_processing": true,
+///       "inactivity_timeout_seconds": 600,
+///       "max_duration_seconds": 14400,
 ///       "on_stop": "my-hook"
 ///     }
 ///
@@ -37,6 +39,22 @@ enum Config {
     /// minutes so long dictation is practical without unbounded memory.
     static func dictationMaximumSeconds() -> Int {
         guard let seconds = load()?["dictation_max_seconds"] as? Int, seconds > 0 else { return 600 }
+        return seconds
+    }
+
+    /// Stop a recording automatically after this many seconds without any
+    /// audible signal on either track (mic or system). Defaults to 10
+    /// minutes; 0 disables.
+    static func inactivityTimeoutSeconds() -> Int {
+        guard let seconds = load()?["inactivity_timeout_seconds"] as? Int, seconds >= 0 else { return 600 }
+        return seconds
+    }
+
+    /// Hard cap on recording length, in seconds — a backstop against a
+    /// forgotten session even if silence never registers. Defaults to 4
+    /// hours; 0 disables.
+    static func maximumDurationSeconds() -> Int {
+        guard let seconds = load()?["max_duration_seconds"] as? Int, seconds >= 0 else { return 14400 }
         return seconds
     }
 
