@@ -38,17 +38,18 @@ final class DictationAudio: Sendable {
                 state.error = "Cannot allocate microphone buffer."
                 return
             }
-            let supplied = Mutex(false)
+            // A plain local flag, not a Mutex: convert invokes the callback
+            // synchronously on this thread, and Xcode 27's Swift 6.4 frontend
+            // crashes ("copy of noncopyable typed value") when the Mutex is
+            // captured into the callback closure.
+            var supplied = false
             var error: NSError?
             let status = converter.convert(to: output, error: &error) { _, inputStatus in
-                guard supplied.withLock({ value in
-                    if value { return false }
-                    value = true
-                    return true
-                }) else {
+                if supplied {
                     inputStatus.pointee = .noDataNow
                     return nil
                 }
+                supplied = true
                 inputStatus.pointee = .haveData
                 return buffer
             }

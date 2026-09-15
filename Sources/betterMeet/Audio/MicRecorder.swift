@@ -52,6 +52,9 @@ final class MicRecorder: @unchecked Sendable {
     private(set) var firstBufferAt: Date?
     /// Host time for the first frame, shared with Core Audio's clock.
     private(set) var firstBufferHostTime: UInt64?
+    /// Wall-clock time of the most recent buffer with audible signal. Written
+    /// from the tap, read from main by the auto-stop logic.
+    private(set) var lastActivityAt: Date?
 
     // Liveness check state (voice-processing path only). Written from the tap
     // callback, read on main when deciding to fall back.
@@ -236,6 +239,9 @@ final class MicRecorder: @unchecked Sendable {
                 )
                 if converted.frameLength > 0 {
                     try file.write(from: converted)
+                    if Self.peak(of: converted) > Self.activityThreshold {
+                        self.lastActivityAt = Date()
+                    }
                 }
             } catch {
                 self.reportWriteFailure(error)
@@ -274,6 +280,9 @@ final class MicRecorder: @unchecked Sendable {
                 )
                 if converted.frameLength > 0 {
                     try file.write(from: converted)
+                    if Self.peak(of: converted) > Self.activityThreshold {
+                        self.lastActivityAt = Date()
+                    }
                 }
             } catch {
                 self.reportWriteFailure(error)
@@ -284,6 +293,24 @@ final class MicRecorder: @unchecked Sendable {
     private func configure(_ converter: AVAudioConverter) {
         converter.primeMethod = .none
         converter.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+    }
+
+    /// Peak amplitude above which a buffer counts as "somebody made a sound"
+    /// for the auto-stop logic (~ -40 dBFS — well above the noise floor, far
+    /// below speech).
+    static let activityThreshold: Float = 0.01
+
+    /// Peak amplitude across all float channels, or 0 if the format isn't
+    /// float (never happens with the formats we record).
+    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData else { return 0 }
+        var peak: Float = 0
+        for channel in 0..<Int(buffer.format.channelCount) {
+            for i in 0..<Int(buffer.frameLength) {
+                peak = max(peak, abs(data[channel][i]))
+            }
+        }
+        return peak
     }
 
     private func convert(

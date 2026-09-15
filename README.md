@@ -85,6 +85,8 @@ Configuration is optional. These are the defaults; merge changes into
 {
   "mic_voice_processing": false,
   "dictation_max_seconds": 600,
+  "inactivity_timeout_seconds": 600,
+  "max_duration_seconds": 14400,
   "transcription": {
     "model": "v3",
     "speech_detection": "annotate"
@@ -96,6 +98,11 @@ Configuration is optional. These are the defaults; merge changes into
   translates speech into English.
 - `dictation_max_seconds` caps live dictation audio kept in memory. The default
   is 600 seconds (10 minutes).
+- `inactivity_timeout_seconds` stops a recording after this many seconds with
+  no audible sound on either track. A notification warns one minute ahead;
+  making any sound cancels it. The default is 600 seconds (10 minutes).
+- `max_duration_seconds` is a hard cap on recording length regardless of
+  activity. The default is 14400 seconds (4 hours).
 - `annotate` flags suspicious audio without removing words. `off` disables speech
   detection; experimental `filter` excludes non-speech spans from the readable
   transcript while retaining them in JSON.

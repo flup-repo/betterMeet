@@ -113,6 +113,10 @@ final class AppController {
     private var session: RecordingSession?
     private var ticker: Timer?
     private var shuttingDown = false
+    /// The activity timestamp the pending-stop warning was issued for. When
+    /// real audio comes in, `lastActivityAt` moves past it and the warning
+    /// arms again for the next quiet stretch.
+    private var inactivityWarnedFor: Date?
 
     init(root: URL) {
         self.root = root
@@ -184,6 +188,7 @@ final class AppController {
             }
             try newSession.start()
             session = newSession
+            inactivityWarnedFor = nil
             FileHandle.standardError.write(Data("● recording → \(newSession.dir.path)\n".utf8))
         } catch {
             FileHandle.standardError.write(Data("recording start failed: \(error)\n".utf8))
@@ -234,10 +239,43 @@ final class AppController {
 
     private func tick() {
         guard let session else { return }
+        let now = Date()
         menuBar.update(
             recording: true,
-            elapsed: Self.format(Date().timeIntervalSince(session.startedAt))
+            elapsed: Self.format(now.timeIntervalSince(session.startedAt))
         )
+
+        // Hard cap: no session may outlive this, silence or not.
+        let maxDuration = TimeInterval(Config.maximumDurationSeconds())
+        if maxDuration > 0, now.timeIntervalSince(session.startedAt) >= maxDuration {
+            stopSession()
+            notifyUser(
+                title: "betterMeet — recording stopped",
+                body: "Reached the \(Self.format(maxDuration)) limit; finalizing and transcribing."
+            )
+            return
+        }
+
+        // Inactivity: stop when neither track has produced sound for a while,
+        // with a warning a minute ahead so a quiet stretch can be ridden out
+        // by making some noise.
+        let timeout = TimeInterval(Config.inactivityTimeoutSeconds())
+        guard timeout > 0 else { return }
+        let lastActivity = session.lastActivityAt ?? session.startedAt
+        let silence = now.timeIntervalSince(lastActivity)
+        if silence >= timeout {
+            stopSession()
+            notifyUser(
+                title: "betterMeet — recording stopped",
+                body: "No sound for \(Self.format(timeout)); session finalized and queued for transcription."
+            )
+        } else if silence >= timeout - 60, inactivityWarnedFor != lastActivity {
+            inactivityWarnedFor = lastActivity
+            notifyUser(
+                title: "betterMeet — still recording?",
+                body: "No sound for a while. Stops automatically in ~1 minute unless audio resumes."
+            )
+        }
     }
 
     private func openFolder() {

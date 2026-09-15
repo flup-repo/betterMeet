@@ -20,6 +20,12 @@ final class RecordingSession {
     let dir: URL
     let startedAt = Date()
 
+    /// Wall-clock time of the most recent audible buffer on either track, or
+    /// nil until the first signal arrives. Drives the inactivity auto-stop.
+    var lastActivityAt: Date? {
+        [mic.lastActivityAt, system.lastActivityAt].compactMap { $0 }.max()
+    }
+
     private let mic = MicRecorder()
     private let system = SystemAudioRecorder()
     var onFailure: (@Sendable (String) -> Void)? {
