@@ -107,6 +107,9 @@ final class MenuBarController {
     private var heldHotKeys: Set<UInt32> = []
     private var dictationKeyPressDate: Date?
     private var dictationShortcutAvailable = true
+    /// Retries the event tap while permission is missing, so granting it in
+    /// System Settings takes effect without restarting the daemon.
+    private var dictationTapRetry: Timer?
     private weak var recordingRow: ShortcutRowView?
     private weak var dictationRow: ShortcutRowView?
 
@@ -230,25 +233,51 @@ final class MenuBarController {
     /// Option keys apart, so dictation uses a global event tap filtered on the
     /// right-Option key code. The tap consumes those events, dedicating right
     /// Option to dictation while left Option keeps its normal behavior.
+    ///
+    /// A consuming tap needs Accessibility and Input Monitoring permission.
+    /// Each rebuild of this ad-hoc signed binary invalidates earlier grants, so
+    /// on failure ask macOS to prompt for both (it links to the right Settings
+    /// pane) and keep retrying until the user grants them.
     private func installDictationEventTap() {
+        guard !createDictationEventTap() else { return }
+        dictationShortcutAvailable = false
+        refresh()
+        Log.write("warning: couldn't create right-option dictation event tap "
+            + "(accessibility=\(AXIsProcessTrusted()) input_monitoring=\(CGPreflightListenEventAccess())); "
+            + "requesting permission and retrying")
+        if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        if !AXIsProcessTrusted() { DictationDestination.requestPermission() }
+        let retry = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.createDictationEventTap() else { return }
+                self.dictationTapRetry?.invalidate()
+                self.dictationTapRetry = nil
+                self.dictationShortcutAvailable = true
+                self.refresh()
+                Log.write("right-option dictation shortcut ready")
+            }
+        }
+        RunLoop.main.add(retry, forMode: .common)
+        dictationTapRetry = retry
+    }
+
+    private func createDictationEventTap() -> Bool {
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: Self.dictationTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            dictationShortcutAvailable = false
-            refresh()
-            Log.write("warning: couldn't create right-option dictation event tap\n")
-            return
-        }
+        ) else { return false }
         dictationEventTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         dictationTapRunSource = source
+        return true
     }
 
     func shutdown() {
+        dictationTapRetry?.invalidate()
+        dictationTapRetry = nil
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
             self.hotKeyRef = nil
