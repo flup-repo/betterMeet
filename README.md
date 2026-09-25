@@ -172,3 +172,7 @@ app. Optional Python tools in `Scripts/` provide local Ollama punctuation cleanu
 (`clean_transcript.py`) and scoring against a manually verified reference
 (`evaluate_transcript.py`); each has `--help`. Cleanup writes a separate file.
 Custom `on_stop` hooks can execute external commands and are not sandboxed.
+
+## License
+
+Released under the [MIT License](LICENSE).
