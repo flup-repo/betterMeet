@@ -13,8 +13,8 @@ enum DictationShortcut {
 
 /// Menu-item row that draws the item title on the left and a fixed shortcut
 /// string right-aligned, mirroring how AppKit renders key equivalents
-/// (including the accent-color highlight). Used for both global-shortcut
-/// rows so their shortcut styling matches exactly — NSMenuItem's own
+/// (including the accent-color highlight). Used for every row that shows a
+/// shortcut, so their styling and right edge match exactly — NSMenuItem's own
 /// keyEquivalent can only render a single glyph, and macOS has no glyph
 /// for the right-Option key, while dark-mode vibrancy makes matching the
 /// native grey with a custom color unreliable.
@@ -32,6 +32,9 @@ private final class ShortcutRowView: NSView {
         self.item = item
         self.shortcutLabel = NSTextField(labelWithString: shortcut)
         super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        // Stretch to the menu's width so every shortcut ends at the same
+        // right edge, whatever the row's own content width.
+        autoresizingMask = [.width]
         for label in [titleLabel, shortcutLabel] {
             label.font = NSFont.menuFont(ofSize: 0)
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -66,6 +69,13 @@ private final class ShortcutRowView: NSView {
             + shortcutLabel.intrinsicContentSize.width + 30
         if frame.width < needed { frame.size.width = needed }
         needsDisplay = true
+    }
+
+    /// A click closes the menu before mouseExited arrives; without this the
+    /// row would reopen still drawn as highlighted.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if highlighted { highlighted = false }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -179,6 +189,9 @@ final class MenuBarController {
             action: #selector(quitClicked),
             keyEquivalent: "q"
         )
+        // Same custom row as the global shortcuts, so all three render and
+        // align identically; the key equivalent still quits while the menu is open.
+        quit.view = ShortcutRowView(item: quit, shortcut: "⌘Q")
         menu.addItem(quit)
 
         for item in [toggleItem, dictationItem, cancelDictationItem, openFolder, quit] {
