@@ -30,7 +30,7 @@
     --max: 1180px;
   }
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; scroll-padding-top: 56px; }
+  html { scroll-behavior: smooth; scroll-padding-top: 56px; overflow-x: clip; }
   body {
     margin: 0;
     background: var(--ink);
@@ -109,7 +109,7 @@
   .menu hr { border: 0; height: 1px; background: rgba(255,255,255,.1); margin: 5px 8px; }
 
   /* ---------- hero ---------- */
-  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; padding: 110px 0 70px; isolation: isolate; }
+  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; padding: 110px 0 70px; isolation: isolate; overflow-x: clip; }
   .hero::after { /* amber glow behind the eye */
     content: ""; position: absolute; z-index: -1; right: -10vw; top: 8vh; width: 70vw; height: 70vw; max-width: 900px; max-height: 900px;
     background: radial-gradient(closest-side, rgba(255,176,0,.16), rgba(255,176,0,.05) 55%, transparent 72%);
