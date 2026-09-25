@@ -95,8 +95,8 @@ private final class ShortcutRowView: NSView {
     }
 }
 
-/// Status bar item in the top-right of the menu bar. The icon shows closed
-/// eyes while idle and open eyes while recording so the capture state is
+/// Status bar item in the top-right of the menu bar. The icon shows a closed
+/// eye while idle and an open eye while recording so the capture state is
 /// visible at a glance. The menu provides the daemon's only persistent control
 /// surface (since we run as `.accessory` — no dock icon, no main window).
 @MainActor
@@ -310,7 +310,7 @@ final class MenuBarController {
     }
 
     /// Reflect recording state in the menu item titles and in the status-bar
-    /// icon (open eyes while recording, closed eyes when idle). Call once a
+    /// icon (open eye while recording, closed eye when idle). Call once a
     /// second while recording.
     func update(recording: Bool, elapsed: String?) {
         self.recording = recording
@@ -355,18 +355,18 @@ final class MenuBarController {
         transcriptionLabel.isHidden = text == nil
     }
 
-    // Inlined eye icons. Keeping them in source means the executable has no
-    // separate resource bundle to install alongside it — true single-binary.
-    // Both are monochrome strokes so macOS recolors them as template images;
-    // colored gradients wouldn't survive menu-bar templating.
+    // Inlined eye icons: a filled rounded-square badge with the eye cut out
+    // (even-odd fill), a closed lid while idle and an open eye while working.
+    // Keeping them in source means the executable has no separate resource
+    // bundle to install alongside it — true single-binary. Both are monochrome
+    // so macOS recolors them as template images; colored gradients wouldn't
+    // survive menu-bar templating.
     private static let eyesClosedSVG = """
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" \
-    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" \
-    stroke-linecap="round" stroke-linejoin="round">\
-    <path d="M1.5 10.5c2 3.2 6.5 3.2 8.5 0"/>\
-    <path d="M3.6 12.7v1.9M5.75 13.5v1.9M7.9 12.7v1.9"/>\
-    <path d="M14 10.5c2 3.2 6.5 3.2 8.5 0"/>\
-    <path d="M16.1 12.7v1.9M18.25 13.5v1.9M20.4 12.7v1.9"/>\
+    viewBox="0 0 24 24">\
+    <path fill="currentColor" fill-rule="evenodd" d="M7 2h10a5 5 0 0 1 5 5v10\
+    a5 5 0 0 1-5 5H7a5 5 0 0 1-5-5V7a5 5 0 0 1 5-5Zm-2 9c3 5.2 11 5.2 14 0\
+    -3 3.2-11 3.2-14 0Z"/>\
     </svg>
     """
 
@@ -376,16 +376,14 @@ final class MenuBarController {
 
     private static func eyesClosedImage() -> NSImage? { eyesClosed }
 
-    /// Open eyes: the recording-state variant. Stays a template image so
+    /// Open eye: the recording-state variant. Stays a template image so
     /// macOS recolors it for the menu bar appearance.
     private static let eyesOpenSVG = """
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" \
-    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" \
-    stroke-linecap="round" stroke-linejoin="round">\
-    <path d="M1.5 12c2-3.8 7-3.8 9 0-2 3.8-7 3.8-9 0Z"/>\
-    <circle cx="6" cy="12" r="2" fill="currentColor" stroke="none"/>\
-    <path d="M13.5 12c2-3.8 7-3.8 9 0-2 3.8-7 3.8-9 0Z"/>\
-    <circle cx="18" cy="12" r="2" fill="currentColor" stroke="none"/>\
+    viewBox="0 0 24 24">\
+    <path fill="currentColor" fill-rule="evenodd" d="M7 2h10a5 5 0 0 1 5 5v10\
+    a5 5 0 0 1-5 5H7a5 5 0 0 1-5-5V7a5 5 0 0 1 5-5Zm-2.5 10c3-5.5 12-5.5 15 0\
+    -3 5.5-12 5.5-15 0Zm7.5-2.6a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 1 0 0-5.2Z"/>\
     </svg>
     """
 
