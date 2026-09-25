@@ -1,7 +1,6 @@
 __pycache__/
 .build/
 .DS_Store
-AGENTS.md
 
 # IDEs and editors
 .idea/
