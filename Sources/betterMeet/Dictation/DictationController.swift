@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import AppKit
 import ApplicationServices
@@ -45,6 +46,11 @@ final class DictationController {
     private var targetChanged = false
     private var sleepObserver: NSObjectProtocol?
     private var inputMonitor: Any?
+    private var focusObserver: DictationFocusObserver?
+    /// Audio before `committedSamples` is already recognized as `committedText`;
+    /// previews and the final pass only transcribe what follows.
+    private var committedSamples = 0
+    private var committedText = ""
 
     init() {
         capture.onFailure = { [weak self] in
@@ -78,6 +84,8 @@ final class DictationController {
         stopInputMonitor()
         capture.discard()
         destination = nil
+        committedSamples = 0
+        committedText = ""
         preview = ""
         previewRange = nil
         insertedPreview = nil
@@ -89,7 +97,7 @@ final class DictationController {
     private func start() {
         generation = UUID()
         let id = generation
-        FileHandle.standardError.write(Data("dictation start id=\(id.uuidString.prefix(8)) state=\(state)\n".utf8))
+        Log.write("dictation start id=\(id.uuidString.prefix(8)) state=\(state)\n")
         let originalAppPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         destination = DictationDestination.capture()
         targetChanged = false
@@ -99,7 +107,7 @@ final class DictationController {
                 type: event.type, keyCode: event.type == .keyDown ? event.keyCode : 0
             )
             guard shouldInvalidate else { return }
-            FileHandle.standardError.write(Data("dictation input invalidated type=\(event.type.rawValue) keyCode=\(event.keyCode)\n".utf8))
+            Log.write("dictation input invalidated type=\(event.type.rawValue) keyCode=\(event.keyCode)\n")
             Task { @MainActor in
                 guard let self, self.generation == id else { return }
                 self.targetChanged = true
@@ -110,6 +118,8 @@ final class DictationController {
         insertedPreview = nil
         previewUsedTyping = false
         previewInsertFailed = false
+        committedSamples = 0
+        committedText = ""
         state = .preparing
         if !AXIsProcessTrusted() { DictationDestination.requestPermission() }
         Task {
@@ -134,24 +144,19 @@ final class DictationController {
                 }
                 try capture.start()
                 state = .listening
-                FileHandle.standardError.write(Data("dictation listening id=\(id.uuidString.prefix(8))\n".utf8))
+                Log.write("dictation listening id=\(id.uuidString.prefix(8))\n")
                 startPreview(id: id)
+                // Focus and window changes arrive as AX notifications, so the
+                // timer only backs them up (for apps that don't post them)
+                // at 1 Hz instead of issuing AX IPC on the main thread at 4 Hz.
+                startFocusObserver()
                 let listeningStarted = ContinuousClock.now
-                let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+                let maximum = Duration.seconds(Config.dictationMaximumSeconds())
+                let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
                     MainActor.assumeIsolated {
                         guard let self, self.state == .listening else { return }
-                        if !self.targetChanged, let destination = self.destination {
-                            // Typed previews intentionally change the text, so
-                            // only focus/window/field changes invalidate the target.
-                            let reason = (self.previewUsedTyping || self.previewRange != nil)
-                                ? destination.focusRejectionReason()
-                                : destination.rejectionReason()
-                            if let reason {
-                                FileHandle.standardError.write(Data("dictation destination invalidated: \(reason)\n".utf8))
-                                self.targetChanged = true
-                            }
-                        }
-                        if self.capture.audio.isFull || listeningStarted.duration(to: .now) >= .seconds(Config.dictationMaximumSeconds()) {
+                        self.checkDestination()
+                        if self.capture.audio.isFull || listeningStarted.duration(to: .now) >= maximum {
                             self.finish()
                         }
                     }
@@ -165,24 +170,50 @@ final class DictationController {
         }
     }
 
+    private func startFocusObserver() {
+        guard let destination else { return }
+        focusObserver = DictationFocusObserver(pid: destination.pid) { [weak self] in
+            self?.checkDestination()
+        }
+    }
+
+    /// Invalidate the destination once its app, window or field changes.
+    private func checkDestination() {
+        guard state == .listening, !targetChanged, let destination else { return }
+        // Typed previews intentionally change the text, so
+        // only focus/window/field changes invalidate the target.
+        let reason = (previewUsedTyping || previewRange != nil)
+            ? destination.focusRejectionReason()
+            : destination.rejectionReason()
+        if let reason {
+            Log.write("dictation destination invalidated: \(reason)")
+            targetChanged = true
+        }
+    }
+
+    /// Each preview transcribes only the audio after the committed prefix.
+    /// Once that tail grows long, its older part is recognized once at a quiet
+    /// point and committed, so preview cost stays bounded instead of growing
+    /// with the whole dictation, and the final pass only covers the tail.
     private func startPreview(id: UUID) {
         previewTask = Task {
             while !Task.isCancelled, generation == id, state == .listening {
                 do {
                     try await Task.sleep(for: .milliseconds(1500))
                     guard !Task.isCancelled, generation == id, state == .listening else { return }
-                    let samples = try capture.audio.snapshot()
-                    guard samples.count >= 4000 else { continue }
-                    let task = Task {
-                        try await InferenceService.shared.request(
-                            InferenceRequest(operation: .dictate, samples: samples)
-                        )
+                    var tail = try capture.audio.snapshot(from: committedSamples)
+                    guard tail.count >= 4000 else { continue }
+                    if let split = DictationChunking.splitPoint(tail) {
+                        let reply = try await recognizePreview(Array(tail[..<split]))
+                        guard !Task.isCancelled, generation == id, state == .listening else { return }
+                        committedText = DictationChunking.join(committedText, reply.text ?? "")
+                        committedSamples += split
+                        tail.removeFirst(split)
+                        Log.write("dictation committed chunk seconds=\(split / 16_000)")
                     }
-                    previewInFlight = task
-                    let reply = try await task.value
+                    let reply = try await recognizePreview(tail)
                     guard !Task.isCancelled, generation == id, state == .listening else { return }
-                    previewInFlight = nil
-                    preview = reply.text ?? ""
+                    preview = DictationChunking.join(committedText, reply.text ?? "")
                     insertPreview(preview)
                 } catch is CancellationError {
                     return
@@ -195,40 +226,54 @@ final class DictationController {
         }
     }
 
+    private func recognizePreview(_ samples: [Float]) async throws -> InferenceReply {
+        let task = Task {
+            try await InferenceService.shared.request(InferenceRequest(operation: .dictate, samples: samples))
+        }
+        previewInFlight = task
+        defer { previewInFlight = nil }
+        return try await task.value
+    }
+
     private func finish() {
         guard state == .listening else { return }
         let id = generation
-        FileHandle.standardError.write(Data("dictation finish id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil) targetChanged=\(targetChanged)\n".utf8))
+        Log.write("dictation finish id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil) targetChanged=\(targetChanged)\n")
         state = .processing
         ticker?.invalidate()
         ticker = nil
+        focusObserver = nil
         capture.stop()
         previewTask?.cancel()
         previewTask = nil
         let activePreview = previewInFlight
+        // A commit still in flight is discarded (state is no longer
+        // .listening), so this prefix and offset stay consistent.
+        let prefix = committedText
+        let committed = committedSamples
         let began = ContinuousClock.now
         Task {
             do {
-                let samples = try capture.audio.snapshot()
+                let samples = try capture.audio.snapshot(from: committed)
                 capture.audio.clear()
                 if let activePreview { _ = try? await activePreview.value }
                 guard generation == id else { return }
-                guard !samples.isEmpty else {
-                    FileHandle.standardError.write(Data("dictation finish empty_audio id=\(id.uuidString.prefix(8))\n".utf8))
+                guard !samples.isEmpty || committed > 0 else {
+                    Log.write("dictation finish empty_audio id=\(id.uuidString.prefix(8))\n")
                     fail("No microphone audio received. Please retry.")
                     return
                 }
-                let reply = try await InferenceService.shared.request(
+                let tailText = samples.isEmpty ? "" : try await InferenceService.shared.request(
                     InferenceRequest(operation: .dictate, samples: samples)
-                )
+                ).text ?? ""
                 await InferenceService.shared.endDictation(id)
                 guard generation == id else { return }
-                let text = reply.text ?? ""
+                let text = DictationChunking.join(prefix, tailText)
                 let insertion: DictationDestination.InsertionResult
                 stopInputMonitor()
                 if !text.isEmpty, self.destination != nil {
                     state = .inserting
-                    FileHandle.standardError.write(Data("dictation insert id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil)\n".utf8))
+                    Log.write("dictation insert id=\(id.uuidString.prefix(8)) previewRange=\(previewRange != nil)\n")
                     if previewUsedTyping, let inserted = insertedPreview {
                         if text == inserted {
                             insertion = .inserted
@@ -247,9 +292,7 @@ final class DictationController {
                     }
                 } else {
                     insertion = .copyRequired
-                    FileHandle.standardError.write(Data(
-                        "dictation copy fallback: destination=\(destination != nil) text=\(!text.isEmpty)\n".utf8
-                    ))
+                    Log.write("dictation copy fallback: destination=\(destination != nil) text=\(!text.isEmpty)\n")
                 }
                 guard generation == id else { return }
                 let elapsed = began.duration(to: .now).components
@@ -265,10 +308,10 @@ final class DictationController {
                         let board = NSPasteboard.general
                         board.clearContents()
                         board.setString(text, forType: .string)
-                        FileHandle.standardError.write(Data("dictation insertion fallback=clipboard timing=\(timing)\n".utf8))
+                        Log.write("dictation insertion fallback=clipboard timing=\(timing)\n")
                     }
                 } else {
-                    FileHandle.standardError.write(Data("dictation result=no_speech timing=\(timing)\n".utf8))
+                    Log.write("dictation result=no_speech timing=\(timing)\n")
                 }
                 destination = nil
                 previewRange = nil
@@ -283,12 +326,13 @@ final class DictationController {
 
     private func fail(_ message: String) {
         cancel()
-        FileHandle.standardError.write(Data("dictation failed: \(message)\n".utf8))
+        Log.write("dictation failed: \(message)\n")
     }
 
     private func stopInputMonitor() {
         if let inputMonitor { NSEvent.removeMonitor(inputMonitor) }
         inputMonitor = nil
+        focusObserver = nil
     }
 
     /// Best-effort live preview: type only the part of the transcript that
@@ -309,28 +353,117 @@ final class DictationController {
             let suffix = String(decoding: newUnits[common...], as: UTF16.self)
             if deleteCount > 0, self.destination?.deleteBackward(deleteCount) != true {
                 previewInsertFailed = true
-                FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+                Log.write("dictation live preview unavailable\n")
                 return
             }
             if !suffix.isEmpty, self.destination?.type(suffix) == true {
                 insertedPreview = text
                 previewUsedTyping = true
-                FileHandle.standardError.write(Data("dictation live preview revised delete=\(deleteCount) len=\(suffix.utf16.count)\n".utf8))
+                Log.write("dictation live preview revised delete=\(deleteCount) len=\(suffix.utf16.count)\n")
             } else if deleteCount == 0 && suffix.isEmpty {
                 insertedPreview = text
             } else {
                 previewInsertFailed = true
-                FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+                Log.write("dictation live preview unavailable\n")
             }
             return
         }
         if self.destination?.type(text) == true {
             insertedPreview = text
             previewUsedTyping = true
-            FileHandle.standardError.write(Data("dictation live preview typed len=\(text.utf16.count)\n".utf8))
+            Log.write("dictation live preview typed len=\(text.utf16.count)\n")
         } else {
             previewInsertFailed = true
-            FileHandle.standardError.write(Data("dictation live preview unavailable\n".utf8))
+            Log.write("dictation live preview unavailable\n")
+        }
+    }
+}
+
+/// Where live dictation splits long audio into independently recognized
+/// chunks: at the quietest 100 ms between a minimum chunk length and the most
+/// recent seconds, which stay uncommitted so words in progress aren't cut.
+enum DictationChunking {
+    static let commitAfterSamples = 20 * 16_000
+    static let minimumChunkSamples = 8 * 16_000
+    static let keepTailSamples = 4 * 16_000
+    static let windowSamples = 1_600
+
+    static func splitPoint(_ samples: [Float]) -> Int? {
+        guard samples.count >= commitAfterSamples else { return nil }
+        let upper = samples.count - keepTailSamples - windowSamples
+        guard upper >= minimumChunkSamples else { return nil }
+        return samples.withUnsafeBufferPointer { buffer -> Int in
+            var best = minimumChunkSamples
+            var bestEnergy = Float.infinity
+            var start = minimumChunkSamples
+            while start <= upper {
+                var energy: Float = 0
+                vDSP_svesq(buffer.baseAddress! + start, 1, &energy, vDSP_Length(windowSamples))
+                if energy < bestEnergy {
+                    bestEnergy = energy
+                    best = start
+                }
+                start += windowSamples / 2
+            }
+            return best + windowSamples / 2
+        }
+    }
+
+    static func join(_ prefix: String, _ text: String) -> String {
+        [prefix, text].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+}
+
+/// Accessibility focus/window notifications for the dictation target, plus
+/// app activation, so destination changes are seen as they happen without
+/// polling the target app over AX IPC from the main thread.
+@MainActor
+final class DictationFocusObserver {
+    private var observer: AXObserver?
+    private let application: AXUIElement
+    private var activation: NSObjectProtocol?
+    fileprivate let onChange: () -> Void
+    private static let notifications = [
+        kAXFocusedUIElementChangedNotification, kAXFocusedWindowChangedNotification,
+        kAXMainWindowChangedNotification, kAXApplicationDeactivatedNotification,
+    ]
+
+    init(pid: pid_t, onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        application = AXUIElementCreateApplication(pid)
+        var created: AXObserver?
+        if AXObserverCreate(pid, Self.callback, &created) == .success, let created {
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            for name in Self.notifications {
+                _ = AXObserverAddNotification(created, application, name as CFString, refcon)
+            }
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+            observer = created
+        }
+        activation = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.onChange() }
+        }
+    }
+
+    isolated deinit {
+        if let observer {
+            for name in Self.notifications {
+                AXObserverRemoveNotification(observer, application, name as CFString)
+            }
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        if let activation { NSWorkspace.shared.notificationCenter.removeObserver(activation) }
+    }
+
+    /// Delivered on the main run loop, where the source was added.
+    private static let callback: AXObserverCallback = { _, _, _, refcon in
+        guard let refcon else { return }
+        let address = UInt(bitPattern: refcon)
+        MainActor.assumeIsolated {
+            guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
+            Unmanaged<DictationFocusObserver>.fromOpaque(pointer).takeUnretainedValue().onChange()
         }
     }
 }

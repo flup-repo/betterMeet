@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Optional user config at ~/.config/betterMeet/config.json:
 ///
@@ -8,6 +9,7 @@ import Foundation
 ///       "mic_voice_processing": true,
 ///       "inactivity_timeout_seconds": 600,
 ///       "max_duration_seconds": 14400,
+///       "inference_idle_seconds": 300,
 ///       "on_stop": "my-hook"
 ///     }
 ///
@@ -58,6 +60,14 @@ enum Config {
         return seconds
     }
 
+    /// How long the inference worker keeps models loaded after its last
+    /// request, in seconds. Defaults to 5 minutes so repeated dictation stays
+    /// fast; 0 unloads immediately to minimize memory.
+    static func inferenceIdleSeconds() -> Int {
+        guard let seconds = load()?["inference_idle_seconds"] as? Int, seconds >= 0 else { return 300 }
+        return seconds
+    }
+
     /// Whether finished recordings are transcribed automatically. Default on.
     static func transcriptionEnabled() -> Bool {
         transcription()?["enabled"] as? Bool ?? true
@@ -90,20 +100,42 @@ enum Config {
         load()?["mic_voice_processing"] as? Bool ?? false
     }
 
+    /// Parsed config, reused until the file's modification date or size
+    /// changes. Callers ask several times a second while recording; a stat is
+    /// far cheaper than re-reading and re-parsing JSON each time.
+    private struct Stamp: Equatable {
+        let modified: Date?
+        let size: Int?
+        let inode: Int?
+    }
+    private struct Cache: @unchecked Sendable {
+        var stamp: Stamp?
+        var json: [String: Any]?
+    }
+    private static let cache = Mutex(Cache())
+
     /// Parse the config file. A malformed config is reported on stderr rather
     /// than silently ignored — recordings landing in an unexpected place is
-    /// worse than a warning.
+    /// worse than a warning. It is reported once per change, not per read.
     private static func load() -> [String: Any]? {
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        guard
-            let data = try? Data(contentsOf: path),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            FileHandle.standardError.write(Data(
-                "warning: \(path.path) is not valid JSON — ignoring config\n".utf8
-            ))
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path) else {
+            cache.withLock { $0 = Cache() }
             return nil
         }
+        let stamp = Stamp(modified: attributes[.modificationDate] as? Date,
+                          size: attributes[.size] as? Int,
+                          inode: attributes[.systemFileNumber] as? Int)
+        let cached = cache.withLock { $0.stamp == stamp ? $0 : nil }
+        if let cached { return cached.json }
+        let json: [String: Any]?
+        if let data = try? Data(contentsOf: path),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            json = parsed
+        } else {
+            Log.write("warning: \(path.path) is not valid JSON — ignoring config")
+            json = nil
+        }
+        cache.withLock { $0 = Cache(stamp: stamp, json: json) }
         return json
     }
 

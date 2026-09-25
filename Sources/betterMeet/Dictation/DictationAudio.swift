@@ -9,6 +9,8 @@ final class DictationAudio: Sendable {
     private struct State {
         var samples: [Float] = []
         var converter: AVAudioConverter?
+        /// Reused across callbacks so the audio thread doesn't allocate.
+        var output: AVAudioPCMBuffer?
         var error: String?
     }
     private let state = Mutex(State())
@@ -34,9 +36,17 @@ final class DictationAudio: Sendable {
                   let converter = state.converter else { return }
             let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength)
                 * Self.sampleRate / buffer.format.sampleRate)) + 32
-            guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {
-                state.error = "Cannot allocate microphone buffer."
-                return
+            let output: AVAudioPCMBuffer
+            if let existing = state.output, existing.frameCapacity >= capacity {
+                existing.frameLength = 0
+                output = existing
+            } else {
+                guard let allocated = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {
+                    state.error = "Cannot allocate microphone buffer."
+                    return
+                }
+                state.output = allocated
+                output = allocated
             }
             // A plain local flag, not a Mutex: convert invokes the callback
             // synchronously on this thread, and Xcode 27's Swift 6.4 frontend
@@ -63,12 +73,21 @@ final class DictationAudio: Sendable {
     }
 
     func snapshot() throws -> [Float] {
+        try snapshot(from: 0)
+    }
+
+    /// Samples from `start` on. Live preview only needs the uncommitted tail,
+    /// so it never copies the whole (up to 38 MB) buffer every 1.5 seconds.
+    func snapshot(from start: Int) throws -> [Float] {
         try state.withLock {
             if let error = $0.error { throw TranscriptionFailure(error) }
+            let lower = min(max(start, 0), $0.samples.count)
             // Copy here, not on the next realtime append via Array's copy-on-write.
-            return $0.samples.withUnsafeBufferPointer { Array($0) }
+            return $0.samples.withUnsafeBufferPointer { Array($0[lower...]) }
         }
     }
+
+    var count: Int { state.withLock { $0.samples.count } }
 
     var isFull: Bool { state.withLock { $0.samples.count >= Self.maximumSamples } }
 

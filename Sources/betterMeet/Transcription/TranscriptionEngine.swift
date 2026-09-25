@@ -28,6 +28,13 @@ protocol TranscriptionEngine: Sendable {
     /// Concrete model identifier recorded as transcript.json provenance.
     var model: String { get }
     func prepare() async throws
-    func transcribe(_ audio: URL) async throws -> TrackTranscription
+    /// `progress` receives 0...1 for long audio; it may be called from any task.
+    func transcribe(_ audio: URL, progress: (@Sendable (Double) -> Void)?) async throws -> TrackTranscription
     func release() async
+}
+
+extension TranscriptionEngine {
+    func transcribe(_ audio: URL) async throws -> TrackTranscription {
+        try await transcribe(audio, progress: nil)
+    }
 }

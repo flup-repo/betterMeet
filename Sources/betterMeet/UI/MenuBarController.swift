@@ -13,8 +13,8 @@ enum DictationShortcut {
 
 /// Menu-item row that draws the item title on the left and a fixed shortcut
 /// string right-aligned, mirroring how AppKit renders key equivalents
-/// (including the accent-color highlight). Used for both global-shortcut
-/// rows so their shortcut styling matches exactly — NSMenuItem's own
+/// (including the accent-color highlight). Used for every row that shows a
+/// shortcut, so their styling and right edge match exactly — NSMenuItem's own
 /// keyEquivalent can only render a single glyph, and macOS has no glyph
 /// for the right-Option key, while dark-mode vibrancy makes matching the
 /// native grey with a custom color unreliable.
@@ -32,6 +32,9 @@ private final class ShortcutRowView: NSView {
         self.item = item
         self.shortcutLabel = NSTextField(labelWithString: shortcut)
         super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
+        // Stretch to the menu's width so every shortcut ends at the same
+        // right edge, whatever the row's own content width.
+        autoresizingMask = [.width]
         for label in [titleLabel, shortcutLabel] {
             label.font = NSFont.menuFont(ofSize: 0)
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -66,6 +69,13 @@ private final class ShortcutRowView: NSView {
             + shortcutLabel.intrinsicContentSize.width + 30
         if frame.width < needed { frame.size.width = needed }
         needsDisplay = true
+    }
+
+    /// A click closes the menu before mouseExited arrives; without this the
+    /// row would reopen still drawn as highlighted.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if highlighted { highlighted = false }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -107,6 +117,9 @@ final class MenuBarController {
     private var heldHotKeys: Set<UInt32> = []
     private var dictationKeyPressDate: Date?
     private var dictationShortcutAvailable = true
+    /// Retries the event tap while permission is missing, so granting it in
+    /// System Settings takes effect without restarting the daemon.
+    private var dictationTapRetry: Timer?
     private weak var recordingRow: ShortcutRowView?
     private weak var dictationRow: ShortcutRowView?
 
@@ -176,6 +189,9 @@ final class MenuBarController {
             action: #selector(quitClicked),
             keyEquivalent: "q"
         )
+        // Same custom row as the global shortcuts, so all three render and
+        // align identically; the key equivalent still quits while the menu is open.
+        quit.view = ShortcutRowView(item: quit, shortcut: "⌘Q")
         menu.addItem(quit)
 
         for item in [toggleItem, dictationItem, cancelDictationItem, openFolder, quit] {
@@ -208,9 +224,7 @@ final class MenuBarController {
             &eventHandlerRef
         )
         guard handlerStatus == noErr else {
-            FileHandle.standardError.write(Data(
-                "warning: couldn't install recording shortcut handler (\(handlerStatus))\n".utf8
-            ))
+            Log.write("warning: couldn't install recording shortcut handler (\(handlerStatus))\n")
             return
         }
 
@@ -224,9 +238,7 @@ final class MenuBarController {
             &hotKeyRef
         )
         if hotKeyStatus != noErr {
-            FileHandle.standardError.write(Data(
-                "warning: couldn't register Control + Option + R (\(hotKeyStatus))\n".utf8
-            ))
+            Log.write("warning: couldn't register Control + Option + R (\(hotKeyStatus))\n")
         }
     }
 
@@ -234,27 +246,51 @@ final class MenuBarController {
     /// Option keys apart, so dictation uses a global event tap filtered on the
     /// right-Option key code. The tap consumes those events, dedicating right
     /// Option to dictation while left Option keeps its normal behavior.
+    ///
+    /// A consuming tap needs Accessibility and Input Monitoring permission.
+    /// Each rebuild of this ad-hoc signed binary invalidates earlier grants, so
+    /// on failure ask macOS to prompt for both (it links to the right Settings
+    /// pane) and keep retrying until the user grants them.
     private func installDictationEventTap() {
+        guard !createDictationEventTap() else { return }
+        dictationShortcutAvailable = false
+        refresh()
+        Log.write("warning: couldn't create right-option dictation event tap "
+            + "(accessibility=\(AXIsProcessTrusted()) input_monitoring=\(CGPreflightListenEventAccess())); "
+            + "requesting permission and retrying")
+        if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+        if !AXIsProcessTrusted() { DictationDestination.requestPermission() }
+        let retry = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.createDictationEventTap() else { return }
+                self.dictationTapRetry?.invalidate()
+                self.dictationTapRetry = nil
+                self.dictationShortcutAvailable = true
+                self.refresh()
+                Log.write("right-option dictation shortcut ready")
+            }
+        }
+        RunLoop.main.add(retry, forMode: .common)
+        dictationTapRetry = retry
+    }
+
+    private func createDictationEventTap() -> Bool {
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: Self.dictationTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            dictationShortcutAvailable = false
-            refresh()
-            FileHandle.standardError.write(Data(
-                "warning: couldn't create right-option dictation event tap\n".utf8
-            ))
-            return
-        }
+        ) else { return false }
         dictationEventTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         dictationTapRunSource = source
+        return true
     }
 
     func shutdown() {
+        dictationTapRetry?.invalidate()
+        dictationTapRetry = nil
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
             self.hotKeyRef = nil
@@ -304,7 +340,8 @@ final class MenuBarController {
         cancelDictationItem.isHidden = !dictation.isBusy
         cancelDictationItem.isEnabled = dictation.canCancel
         if let button = statusItem.button {
-            button.image = recording || dictation.isBusy ? Self.eyesOpenImage() : Self.eyesClosedImage()
+            let image = recording || dictation.isBusy ? Self.eyesOpenImage() : Self.eyesClosedImage()
+            if button.image !== image { button.image = image }
         }
         recordingRow?.syncLabels()
         dictationRow?.syncLabels()
@@ -333,9 +370,11 @@ final class MenuBarController {
     </svg>
     """
 
-    private static func eyesClosedImage() -> NSImage? {
-        svgImage(eyesClosedSVG)
-    }
+    /// Parsed once: refresh() runs every second while recording.
+    private static let eyesClosed = svgImage(eyesClosedSVG)
+    private static let eyesOpen = svgImage(eyesOpenSVG)
+
+    private static func eyesClosedImage() -> NSImage? { eyesClosed }
 
     /// Open eyes: the recording-state variant. Stays a template image so
     /// macOS recolors it for the menu bar appearance.
@@ -350,9 +389,7 @@ final class MenuBarController {
     </svg>
     """
 
-    private static func eyesOpenImage() -> NSImage? {
-        svgImage(eyesOpenSVG)
-    }
+    private static func eyesOpenImage() -> NSImage? { eyesOpen }
 
     private static func svgImage(_ svg: String) -> NSImage? {
         guard let data = svg.data(using: .utf8),
@@ -393,6 +430,15 @@ final class MenuBarController {
     private static let dictationTapCallback:
         @convention(c) (CGEventTapProxy, CGEventType, CGEvent, UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>?
         = { _, type, event, userInfo in
+        // macOS disables a tap whose callback is slow (or on some user input)
+        // and never re-enables it; without this Right ⌥ stays dead until restart.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let userInfo {
+                let controller = Unmanaged<MenuBarController>.fromOpaque(userInfo).takeUnretainedValue()
+                controller.reenableDictationTap()
+            }
+            return Unmanaged.passUnretained(event)
+        }
         guard let userInfo, type == .flagsChanged,
               event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_RightOption)
         else { return Unmanaged.passUnretained(event) }
@@ -407,8 +453,18 @@ final class MenuBarController {
         return nil
     }
 
+    private func reenableDictationTap() {
+        guard let dictationEventTap else { return }
+        Log.write("warning: right-option event tap was disabled by macOS; re-enabling")
+        CGEvent.tapEnable(tap: dictationEventTap, enable: true)
+        // The release may have been lost while the tap was off; a stale "held"
+        // entry would swallow the next press.
+        heldHotKeys.remove(2)
+        dictationKeyPressDate = nil
+    }
+
     private func handleDictationPress() {
-        FileHandle.standardError.write(Data("dictation hotkey press state=\(dictation)\n".utf8))
+        Log.write("dictation hotkey press state=\(dictation)\n")
         if dictation.isBusy {
             // A second press stops the current dictation; the matching release
             // must not toggle it again.
@@ -424,7 +480,7 @@ final class MenuBarController {
         defer { dictationKeyPressDate = nil }
         guard let pressedAt = dictationKeyPressDate else { return }
         let elapsed = Date().timeIntervalSince(pressedAt)
-        FileHandle.standardError.write(Data("dictation hotkey release elapsed=\(elapsed)\n".utf8))
+        Log.write("dictation hotkey release elapsed=\(elapsed)\n")
         if DictationShortcut.shouldStopOnRelease(elapsed: elapsed, state: dictation) {
             onDictation?()
         }

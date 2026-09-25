@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import FluidAudio
 import Foundation
@@ -21,6 +22,8 @@ actor ParakeetEngine: TranscriptionEngine {
     nonisolated let name = "parakeet"
     nonisolated let model: String
     private let settings: TranscriptionSettings
+    private let models: ParakeetModels
+    private let ownsModels: Bool
 
     private var manager: AsrManager?
     private var vad: VadManager?
@@ -28,21 +31,21 @@ actor ParakeetEngine: TranscriptionEngine {
     private var spotter: CtcKeywordSpotter?
     private var rescorer: VocabularyRescorer?
 
-    init(settings: TranscriptionSettings = TranscriptionSettings()) {
+    /// Pass a shared `models` cache to reuse loaded recognizers across engines
+    /// with different settings; the cache owner then releases it.
+    init(settings: TranscriptionSettings = TranscriptionSettings(), models: ParakeetModels? = nil) {
         self.settings = settings
+        self.models = models ?? ParakeetModels()
+        ownsModels = models == nil
         model = "parakeet-tdt-0.6b-\(settings.model.rawValue)-coreml"
     }
 
     func prepare() async throws {
         guard manager == nil else { return }
         try settings.validate()
-        let models = try await AsrModels.downloadAndLoad(
-            version: settings.model == .v2 ? .v2 : .v3, encoderPrecision: .int8
-        )
-        let manager = AsrManager()
-        try await manager.loadModels(models)
+        let manager = try await models.asr(settings.model)
         if settings.speechDetection != .off {
-            vad = try await VadManager(config: VadConfig(defaultThreshold: 0.5))
+            vad = try await models.vad()
         }
         if let path = settings.vocabularyFile {
             let (vocabulary, models) = try await CustomVocabularyContext.loadWithCtcTokens(from: path)
@@ -58,7 +61,7 @@ actor ParakeetEngine: TranscriptionEngine {
         self.manager = manager
     }
 
-    func transcribe(_ audio: URL) async throws -> TrackTranscription {
+    func transcribe(_ audio: URL, progress: (@Sendable (Double) -> Void)? = nil) async throws -> TrackTranscription {
         // A track with no frames (recorder died before its first buffer)
         // makes AVFoundation raise an ObjC exception deep inside the
         // resampler — uncatchable from Swift, so it takes the whole daemon
@@ -72,16 +75,14 @@ actor ParakeetEngine: TranscriptionEngine {
             throw EngineError.unreadableAudio(audio, error)
         }
 
-        // Decode once. Duration is based on decoded PCM, not unreliable ADTS estimates.
-        let samples = try AudioConverter().resampleAudioFile(audio)
-        guard !samples.isEmpty, samples.allSatisfy(\.isFinite) else {
-            throw EngineError.unreadableAudio(audio, nil)
-        }
-        return try await transcribe(samples: samples)
+        // Decode once, streaming. Duration is based on decoded PCM, not unreliable ADTS estimates.
+        let samples = try AudioDecoder.decodeMono16k(audio)
+        guard !samples.isEmpty else { throw EngineError.unreadableAudio(audio, nil) }
+        return try await transcribe(samples: samples, progress: progress)
     }
 
     /// Dictation supplies mono 16 kHz PCM directly, without temporary recordings.
-    func transcribe(samples: [Float]) async throws -> TrackTranscription {
+    func transcribe(samples: [Float], progress: (@Sendable (Double) -> Void)? = nil) async throws -> TrackTranscription {
         guard let manager else { throw EngineError.notPrepared }
         guard !samples.isEmpty, samples.allSatisfy(\.isFinite) else {
             throw TranscriptionFailure("invalid audio samples")
@@ -89,7 +90,19 @@ actor ParakeetEngine: TranscriptionEngine {
         let began = Date()
         let duration = Double(samples.count) / 16_000
         var state = try TdtDecoderState()
+        // FluidAudio reports progress only for audio past one model window.
+        var progressTask: Task<Void, Never>?
+        if let progress {
+            let stream = await manager.transcriptionProgressStream
+            progressTask = Task {
+                do {
+                    for try await value in stream { progress(value) }
+                } catch {}
+            }
+        }
+        defer { progressTask?.cancel() }
         let result = try await manager.transcribe(samples, decoderState: &state)
+        progress?(1)
 
         let words = buildWordTimings(from: result.tokenTimings ?? [])
         var segments = Self.segments(from: words, silenceGap: settings.silenceGap)
@@ -103,6 +116,11 @@ actor ParakeetEngine: TranscriptionEngine {
             minSpeechDuration: 0.1, minSilenceDuration: 0.75,
             maxSpeechDuration: .infinity, speechPadding: 0.1
         ))
+        let tokenTimings = result.tokenTimings ?? []
+        // Segments, VAD spans and tokens are all time-ordered; walk them with
+        // cursors instead of rescanning every list for each segment.
+        var speechCursor = 0
+        var tokenCursor = 0
         for index in segments.indices {
             let segment = segments[index]
             guard segment.start.isFinite, segment.end.isFinite,
@@ -114,9 +132,8 @@ actor ParakeetEngine: TranscriptionEngine {
             let upper = min(samples.count, Int(segment.end * 16_000))
             segments[index].rmsDBFS = Self.rmsDBFS(samples[lower..<upper])
             if let speech {
-                let overlaps = speech.contains {
-                    $0.startTime < segment.end + 0.2 && $0.endTime > segment.start - 0.2
-                }
+                let overlaps = Self.overlapsSpeech(speech, start: segment.start, end: segment.end,
+                                                   cursor: &speechCursor)
                 Self.annotate(&segments[index], overlapsSpeech: overlaps, mode: settings.speechDetection)
             }
             if let vocabulary, let spotter, let rescorer, !segments[index].excluded,
@@ -126,13 +143,20 @@ actor ParakeetEngine: TranscriptionEngine {
                 let from = max(0, lower - 3_200)
                 let to = min(samples.count, upper + 3_200)
                 let offset = Double(from) / 16_000
-                let timings = (result.tokenTimings ?? []).filter {
-                    $0.startTime >= segment.start && $0.startTime <= segment.end
-                        && $0.endTime <= segment.end + 0.001
-                }.map {
-                    TokenTiming(token: $0.token, tokenId: $0.tokenId,
-                                startTime: $0.startTime - offset, endTime: $0.endTime - offset,
-                                confidence: $0.confidence)
+                while tokenCursor < tokenTimings.count, tokenTimings[tokenCursor].startTime < segment.start {
+                    tokenCursor += 1
+                }
+                var timings: [TokenTiming] = []
+                var scan = tokenCursor
+                while scan < tokenTimings.count, tokenTimings[scan].startTime <= segment.end {
+                    let token = tokenTimings[scan]
+                    if token.endTime <= segment.end + 0.001 {
+                        timings.append(TokenTiming(token: token.token, tokenId: token.tokenId,
+                                                   startTime: token.startTime - offset,
+                                                   endTime: token.endTime - offset,
+                                                   confidence: token.confidence))
+                    }
+                    scan += 1
                 }
                 guard !timings.isEmpty else { continue }
                 let evidence = try await spotter.spotKeywordsWithLogProbs(
@@ -159,7 +183,7 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     func release() async {
-        if let manager { await manager.cleanup() }
+        if ownsModels { await models.release() }
         manager = nil
         vad = nil
         vocabulary = nil
@@ -169,8 +193,26 @@ actor ParakeetEngine: TranscriptionEngine {
 
     static func rmsDBFS(_ samples: ArraySlice<Float>) -> Double? {
         guard !samples.isEmpty else { return nil }
-        let power = samples.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(samples.count)
+        let power = samples.withUnsafeBufferPointer { buffer -> Double in
+            var sum: Float = 0
+            vDSP_svesq(buffer.baseAddress!, 1, &sum, vDSP_Length(buffer.count))
+            return Double(sum) / Double(buffer.count)
+        }
         return 10 * log10(max(power, 1e-12))
+    }
+
+    /// Whether any VAD span overlaps [start, end] with 0.2 s tolerance.
+    /// `cursor` only moves forward, since segments arrive in time order.
+    static func overlapsSpeech(_ speech: [VadSegment], start: Double, end: Double, cursor: inout Int) -> Bool {
+        while cursor < speech.count, speech[cursor].endTime <= start - 0.2 {
+            cursor += 1
+        }
+        var index = cursor
+        while index < speech.count, speech[index].startTime < end + 0.2 {
+            if speech[index].endTime > start - 0.2 { return true }
+            index += 1
+        }
+        return false
     }
 
     static func annotate(_ segment: inout TranscriptSegment, overlapsSpeech: Bool,
@@ -215,5 +257,51 @@ actor ParakeetEngine: TranscriptionEngine {
         }
         flush()
         return out
+    }
+}
+
+/// Loaded recognizer models, shared by every engine in one process so that
+/// switching between dictation and meeting settings never reloads them.
+actor ParakeetModels {
+    private var asrTasks: [TranscriptionSettings.Model: Task<AsrManager, Error>] = [:]
+    private var vadTask: Task<VadManager, Error>?
+
+    func asr(_ version: TranscriptionSettings.Model) async throws -> AsrManager {
+        if let task = asrTasks[version] { return try await task.value }
+        let task = Task {
+            let models = try await AsrModels.downloadAndLoad(
+                version: version == .v2 ? .v2 : .v3, encoderPrecision: .int8
+            )
+            let manager = AsrManager()
+            try await manager.loadModels(models)
+            return manager
+        }
+        asrTasks[version] = task
+        do {
+            return try await task.value
+        } catch {
+            asrTasks[version] = nil
+            throw error
+        }
+    }
+
+    func vad() async throws -> VadManager {
+        if let vadTask { return try await vadTask.value }
+        let task = Task { try await VadManager(config: VadConfig(defaultThreshold: 0.5)) }
+        vadTask = task
+        do {
+            return try await task.value
+        } catch {
+            vadTask = nil
+            throw error
+        }
+    }
+
+    func release() async {
+        for task in asrTasks.values {
+            if let manager = try? await task.value { await manager.cleanup() }
+        }
+        asrTasks = [:]
+        vadTask = nil
     }
 }

@@ -68,7 +68,8 @@ enum TranscriptionJob {
     }
 
     static func run(source: URL, output: URL, settings: TranscriptionSettings,
-                    preparedEngine: ParakeetEngine? = nil) async throws -> TranscriptDocument {
+                    preparedEngine: ParakeetEngine? = nil,
+                    progress: (@Sendable (Double) -> Void)? = nil) async throws -> TranscriptDocument {
         let source = source.resolvingSymlinksInPath().standardizedFileURL
         let meta = try SessionMeta.read(from: source)
         var settings = settings
@@ -78,63 +79,91 @@ enum TranscriptionJob {
         var reports: [TrackReport] = []
         do {
             for track in meta.tracks {
-                let audio = source.appendingPathComponent(track.file)
-                let values = try? audio.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-                let checkpointURL = output.appendingPathComponent(".transcription-\(track.speaker).json")
-                if let data = try? Data(contentsOf: checkpointURL),
-                   let saved = try? JSONDecoder().decode(Checkpoint.self, from: data),
-                   saved.schemaVersion == 1, saved.source == source.path,
-                   saved.settings == settings, saved.report.file == track.file,
-                   saved.report.offsetMS == track.offsetMs,
-                   saved.report.sourceBytes == values?.fileSize,
-                   saved.report.sourceModified == values?.contentModificationDate,
-                   saved.report.result != nil, saved.report.error == nil {
-                    reports.append(saved.report)
-                    continue
-                }
-                // Never replace a successful checkpoint under different settings.
-                if FileManager.default.fileExists(atPath: checkpointURL.path) {
-                    throw TranscriptionFailure("checkpoint differs from source/settings; use a new output directory")
-                }
-                let report: TrackReport
-                do {
-                    guard audio.resolvingSymlinksInPath().deletingLastPathComponent() == source else {
-                        throw TranscriptionFailure("audio must reside inside the recording directory")
-                    }
-                    guard FileManager.default.fileExists(atPath: audio.path) else {
-                        throw TranscriptionFailure("missing audio file")
-                    }
-                    try await engine.prepare()
-                    let result = try await engine.transcribe(audio)
-                    var warnings: [String] = []
-                    if let duration = meta.duration,
-                       abs(result.duration + Double(track.offsetMs) / 1000 - duration) > 5 {
-                        warnings.append("decoded duration differs from session duration by more than 5 seconds")
-                    }
-                    report = TrackReport(file: track.file, speaker: track.speaker, offsetMS: track.offsetMs,
-                                         sourceBytes: values?.fileSize, sourceModified: values?.contentModificationDate,
-                                         result: result, error: nil, warnings: warnings)
-                } catch {
-                    report = TrackReport(file: track.file, speaker: track.speaker, offsetMS: track.offsetMs,
-                                         sourceBytes: values?.fileSize, sourceModified: values?.contentModificationDate,
-                                         result: nil, error: String(describing: error), warnings: [])
-                }
-                reports.append(report)
-                if report.result != nil {
-                    let saved = Checkpoint(schemaVersion: 1, source: source.path, settings: settings, report: report)
-                    try JSONEncoder().encode(saved).write(to: checkpointURL, options: .atomic)
-                }
+                reports.append(try await report(for: track, meta: meta, source: source, output: output,
+                                                settings: settings, engine: engine, progress: progress))
             }
         } catch {
             if preparedEngine == nil { await engine.release() }
             throw error
         }
         if preparedEngine == nil { await engine.release() }
+        // Tracks transcribed by earlier per-track requests come from their
+        // checkpoints, so wall time here is only the assembly; report at least
+        // the tracks' own recognition time.
+        let trackSeconds = reports.compactMap { $0.result?.processingSeconds }.reduce(0, +)
         let document = try document(source: source, settings: settings, reports: reports,
-                                    processingSeconds: Date().timeIntervalSince(began))
+                                    processingSeconds: max(Date().timeIntervalSince(began), trackSeconds))
         try document.write(to: output)
         cleanupSuccessfulOutput(document, in: output)
         return document
+    }
+
+    /// Transcribe and checkpoint one track only. A later `run` over the same
+    /// output reuses the checkpoint, so a meeting can be processed track by
+    /// track with dictation allowed to run in between.
+    static func runTrack(_ speaker: String, source: URL, output: URL, settings: TranscriptionSettings,
+                         engine: ParakeetEngine, progress: (@Sendable (Double) -> Void)? = nil) async throws {
+        let source = source.resolvingSymlinksInPath().standardizedFileURL
+        let meta = try SessionMeta.read(from: source)
+        guard let track = meta.tracks.first(where: { $0.speaker == speaker }) else {
+            throw TranscriptionFailure("unknown track")
+        }
+        var settings = settings
+        try settings.resolveVocabulary()
+        _ = try await report(for: track, meta: meta, source: source, output: output,
+                             settings: settings, engine: engine, progress: progress)
+    }
+
+    /// A saved checkpoint when it still matches the source and settings,
+    /// otherwise a fresh transcription (checkpointed on success).
+    private static func report(for track: SessionMeta.Track, meta: SessionMeta, source: URL, output: URL,
+                               settings: TranscriptionSettings, engine: ParakeetEngine,
+                               progress: (@Sendable (Double) -> Void)?) async throws -> TrackReport {
+        let audio = source.appendingPathComponent(track.file)
+        let values = try? audio.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let checkpointURL = output.appendingPathComponent(".transcription-\(track.speaker).json")
+        if let data = try? Data(contentsOf: checkpointURL),
+           let saved = try? JSONDecoder().decode(Checkpoint.self, from: data),
+           saved.schemaVersion == 1, saved.source == source.path,
+           saved.settings == settings, saved.report.file == track.file,
+           saved.report.offsetMS == track.offsetMs,
+           saved.report.sourceBytes == values?.fileSize,
+           saved.report.sourceModified == values?.contentModificationDate,
+           saved.report.result != nil, saved.report.error == nil {
+            return saved.report
+        }
+        // Never replace a successful checkpoint under different settings.
+        if FileManager.default.fileExists(atPath: checkpointURL.path) {
+            throw TranscriptionFailure("checkpoint differs from source/settings; use a new output directory")
+        }
+        let report: TrackReport
+        do {
+            guard audio.resolvingSymlinksInPath().deletingLastPathComponent() == source else {
+                throw TranscriptionFailure("audio must reside inside the recording directory")
+            }
+            guard FileManager.default.fileExists(atPath: audio.path) else {
+                throw TranscriptionFailure("missing audio file")
+            }
+            try await engine.prepare()
+            let result = try await engine.transcribe(audio, progress: progress)
+            var warnings: [String] = []
+            if let duration = meta.duration,
+               abs(result.duration + Double(track.offsetMs) / 1000 - duration) > 5 {
+                warnings.append("decoded duration differs from session duration by more than 5 seconds")
+            }
+            report = TrackReport(file: track.file, speaker: track.speaker, offsetMS: track.offsetMs,
+                                 sourceBytes: values?.fileSize, sourceModified: values?.contentModificationDate,
+                                 result: result, error: nil, warnings: warnings)
+        } catch {
+            report = TrackReport(file: track.file, speaker: track.speaker, offsetMS: track.offsetMs,
+                                 sourceBytes: values?.fileSize, sourceModified: values?.contentModificationDate,
+                                 result: nil, error: String(describing: error), warnings: [])
+        }
+        if report.result != nil {
+            let saved = Checkpoint(schemaVersion: 1, source: source.path, settings: settings, report: report)
+            try JSONEncoder().encode(saved).write(to: checkpointURL, options: .atomic)
+        }
+        return report
     }
 
     static func cleanupSuccessfulOutput(_ document: TranscriptDocument, in output: URL) {

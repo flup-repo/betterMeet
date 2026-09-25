@@ -39,7 +39,7 @@ struct DictationBenchmark: AsyncParsableCommand {
               Double(file.length) / file.processingFormat.sampleRate <= 60 else {
             throw ValidationError("provide readable audio between 0 and 60 seconds")
         }
-        let samples = try AudioConverter().resampleAudioFile(url)
+        let samples = try AudioDecoder.decodeMono16k(url)
         guard !samples.isEmpty, samples.count <= DictationAudio.maximumSamples,
               samples.allSatisfy(\.isFinite) else { throw ValidationError("invalid audio samples") }
         let referenceText = try reference.map { try String(contentsOf: Transcribe.url($0), encoding: .utf8) }
