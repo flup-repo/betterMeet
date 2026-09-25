@@ -87,8 +87,12 @@ enum TranscriptionJob {
             throw error
         }
         if preparedEngine == nil { await engine.release() }
+        // Tracks transcribed by earlier per-track requests come from their
+        // checkpoints, so wall time here is only the assembly; report at least
+        // the tracks' own recognition time.
+        let trackSeconds = reports.compactMap { $0.result?.processingSeconds }.reduce(0, +)
         let document = try document(source: source, settings: settings, reports: reports,
-                                    processingSeconds: Date().timeIntervalSince(began))
+                                    processingSeconds: max(Date().timeIntervalSince(began), trackSeconds))
         try document.write(to: output)
         cleanupSuccessfulOutput(document, in: output)
         return document

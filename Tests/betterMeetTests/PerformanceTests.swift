@@ -171,3 +171,52 @@ final class PerformanceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(".transcription-me.json").path))
     }
 }
+
+final class SystemAudioPoolTests: XCTestCase {
+    /// The IO proc hands the pool a buffer list it doesn't own; the copy must
+    /// carry the samples for both layouts a process tap can report.
+    func testPoolCopiesInterleavedAndPlanarBufferLists() throws {
+        for interleaved in [true, false] {
+            let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                                    channels: 2, interleaved: interleaved))
+            let source = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 512))
+            source.frameLength = 512
+            let list = UnsafeMutableAudioBufferListPointer(source.mutableAudioBufferList)
+            var value: Float = 0
+            for buffer in list {
+                let floats = buffer.mData!.assumingMemoryBound(to: Float.self)
+                for index in 0..<(Int(buffer.mDataByteSize) / 4) {
+                    value += 0.001
+                    floats[index] = value
+                }
+            }
+            let pool = PCMBufferPool(format: format, frameCapacity: 4096, count: 2)
+            let copy = try XCTUnwrap(pool.copy(UnsafePointer(source.mutableAudioBufferList)))
+            XCTAssertEqual(copy.frameLength, 512, "interleaved=\(interleaved)")
+            let copied = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+            XCTAssertEqual(copied.count, list.count)
+            for (original, duplicate) in zip(list, copied) {
+                XCTAssertEqual(duplicate.mDataByteSize, original.mDataByteSize)
+                XCTAssertEqual(memcmp(duplicate.mData!, original.mData!, Int(original.mDataByteSize)), 0)
+            }
+            XCTAssertGreaterThan(MicRecorder.peak(of: copy), 0)
+            // Written to a real AAC file, the audio must survive.
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).aac")
+            defer { try? FileManager.default.removeItem(at: url) }
+            do {
+                let file = try AVAudioFile(forWriting: url, settings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 192_000,
+                ], commonFormat: .pcmFormatFloat32, interleaved: interleaved)
+                for _ in 0..<40 {
+                    let chunk = try XCTUnwrap(pool.copy(UnsafePointer(source.mutableAudioBufferList)))
+                    try file.write(from: chunk)
+                    pool.recycle(chunk)
+                }
+            }
+            let decoded = try AudioDecoder.decodeMono16k(url)
+            XCTAssertGreaterThan(decoded.map(abs).max() ?? 0, 0.01, "interleaved=\(interleaved)")
+            pool.recycle(copy)
+        }
+    }
+}

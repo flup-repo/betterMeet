@@ -234,7 +234,7 @@ final class SystemAudioRecorder: @unchecked Sendable {
 
 /// Fixed set of PCM buffers handed from the IO proc to the writer queue, so
 /// the IO cycle never allocates. Oversized cycles get a one-off buffer.
-private final class PCMBufferPool: @unchecked Sendable {
+final class PCMBufferPool: @unchecked Sendable {
     private let format: AVAudioFormat
     private let frameCapacity: AVAudioFrameCount
     // A plain unfair lock around the free list: AVAudioPCMBuffer isn't
