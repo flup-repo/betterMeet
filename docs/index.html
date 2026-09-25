@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>betterMeet — meeting transcripts and dictation for macOS</title>
+<meta name="description" content="A minimalist macOS menu-bar app that records and transcribes your meetings and types what you dictate. Recognition runs on your Mac.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23ffb000' fill-rule='evenodd' d='M7 2h10a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H7a5 5 0 0 1-5-5V7a5 5 0 0 1 5-5Zm-2.5 10c3-5.5 12-5.5 15 0-3 5.5-12 5.5-15 0Zm7.5-2.6a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 1 0 0-5.2Z'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0d0c0a;
+    --ink-2: #15130f;
+    --ink-3: #1d1a15;
+    --line: #2b2720;
+    --paper: #ece6d9;
+    --dim: #8f8778;
+    --faint: #5b554a;
+    --amber: #ffb000;
+    --amber-soft: rgba(255, 176, 0, .14);
+    --rec: #ff453a;
+    --me: #ffb000;
+    --them: #7fd1c1;
+    --serif: "Instrument Serif", Georgia, serif;
+    --sans: "Hanken Grotesk", system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, monospace;
+    --max: 1180px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 56px; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--paper);
+    font: 400 17px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  body::before { /* film grain */
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 100; opacity: .07;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  a { color: inherit; }
+  ::selection { background: var(--amber); color: var(--ink); }
+  kbd {
+    font: 500 .78em var(--mono);
+    padding: .12em .5em; border-radius: 6px;
+    border: 1px solid var(--line); border-bottom-width: 2px;
+    background: var(--ink-3); color: var(--paper); white-space: nowrap;
+  }
+  code { font-family: var(--mono); font-size: .86em; color: var(--amber); }
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 28px; }
+  .eyebrow {
+    font: 500 12px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; color: var(--amber);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .eyebrow::before { content: ""; width: 28px; height: 1px; background: currentColor; }
+  h1, h2, h3 { font-family: var(--serif); font-weight: 400; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: clamp(40px, 6vw, 76px); line-height: .98; margin: 18px 0 22px; }
+  h2 em, h1 em { color: var(--amber); }
+  .lede { color: var(--dim); font-size: 19px; max-width: 58ch; margin: 0; }
+
+  /* ---------- menu bar as site nav ---------- */
+  .menubar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50; height: 34px;
+    display: flex; align-items: center; justify-content: space-between; padding: 0 14px;
+    background: rgba(21, 19, 15, .72); backdrop-filter: blur(22px) saturate(160%); -webkit-backdrop-filter: blur(22px) saturate(160%);
+    border-bottom: 1px solid rgba(255,255,255,.06);
+    font: 500 13.5px/1 var(--sans);
+  }
+  .menubar nav { display: flex; align-items: center; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .menubar nav::-webkit-scrollbar { display: none; }
+  .menubar nav a { text-decoration: none; padding: 5px 10px; border-radius: 5px; white-space: nowrap; }
+  .menubar nav a:hover { background: rgba(255,255,255,.1); }
+  .menubar nav a.brand { font-weight: 700; }
+  .tray { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+  .tray .rec-time { font: 500 12.5px var(--mono); color: var(--rec); display: none; align-items: center; gap: 6px; }
+  .tray .rec-time::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--rec); animation: pulse 1.2s infinite; }
+  body.recording .tray .rec-time { display: inline-flex; }
+  .eye-btn {
+    all: unset; cursor: pointer; width: 26px; height: 22px; display: grid; place-items: center; border-radius: 5px;
+    position: relative;
+  }
+  .eye-btn:hover, .eye-btn[aria-expanded="true"] { background: rgba(255,255,255,.12); }
+  .eye-btn svg { width: 17px; height: 17px; color: var(--paper); }
+  .eye-btn:focus-visible { outline: 2px solid var(--amber); }
+  #clock { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  /* the dropdown menu, mirroring the real one */
+  .menu {
+    position: fixed; top: 38px; right: 60px; z-index: 60; width: 300px; padding: 5px;
+    background: rgba(36, 33, 28, .86); backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
+    border: 1px solid rgba(255,255,255,.1); border-radius: 10px;
+    box-shadow: 0 20px 50px rgba(0,0,0,.55);
+    font: 400 13.5px/1 var(--sans);
+    opacity: 0; transform: translateY(-4px); pointer-events: none; transition: .15s ease;
+  }
+  .menu.open { opacity: 1; transform: none; pointer-events: auto; }
+  .menu .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; border-radius: 5px; color: var(--paper); }
+  .menu .row.label { color: var(--dim); }
+  .menu button.row { all: unset; box-sizing: border-box; width: 100%; display: flex; justify-content: space-between; padding: 6px 10px; border-radius: 5px; cursor: default; }
+  .menu button.row:hover, .menu button.row:focus-visible { background: #2f6fe0; }
+  .menu .row span:last-child { color: var(--dim); font-size: 12.5px; }
+  .menu button.row:hover span:last-child { color: #dfe8ff; }
+  .menu hr { border: 0; height: 1px; background: rgba(255,255,255,.1); margin: 5px 8px; }
+
+  /* ---------- hero ---------- */
+  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; padding: 110px 0 70px; isolation: isolate; }
+  .hero::after { /* amber glow behind the eye */
+    content: ""; position: absolute; z-index: -1; right: -10vw; top: 8vh; width: 70vw; height: 70vw; max-width: 900px; max-height: 900px;
+    background: radial-gradient(closest-side, rgba(255,176,0,.16), rgba(255,176,0,.05) 55%, transparent 72%);
+    transition: background .6s;
+  }
+  body.recording .hero::after { background: radial-gradient(closest-side, rgba(255,69,58,.18), rgba(255,69,58,.05) 55%, transparent 72%); }
+  .hero-grid { display: grid; grid-template-columns: 1.25fr .9fr; gap: 40px; align-items: center; }
+  .hero h1 { font-size: clamp(56px, 9vw, 132px); line-height: .9; }
+  .hero h1 .line { display: block; overflow: hidden; }
+  .hero h1 .line > span { display: inline-block; animation: rise .9s cubic-bezier(.2,.7,.1,1) both; }
+  .hero h1 .line:nth-child(2) > span { animation-delay: .12s; }
+  .hero .lede { margin-top: 30px; animation: fade 1s .35s both; }
+  .hero-ctas { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 38px; animation: fade 1s .5s both; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 999px;
+    font: 600 15px/1 var(--sans); text-decoration: none; border: 1px solid var(--line); transition: .2s;
+  }
+  .btn.primary { background: var(--amber); color: var(--ink); border-color: var(--amber); }
+  .btn.primary:hover { background: #ffc233; transform: translateY(-1px); }
+  .btn.ghost:hover { border-color: var(--dim); }
+  .btn svg { width: 18px; height: 18px; }
+  .hero-meta { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 44px; color: var(--faint); font: 400 13px var(--mono); animation: fade 1s .65s both; }
+  .hero-meta span::before { content: "— "; }
+
+  .big-eye { position: relative; justify-self: center; width: min(400px, 80vw); aspect-ratio: 1; animation: fade 1.2s .2s both; }
+  .big-eye svg { width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 30px 60px rgba(255,176,0,.22)); transition: filter .6s; }
+  .big-eye .badge { fill: var(--amber); transition: fill .6s; }
+  body.recording .big-eye .badge { fill: var(--rec); }
+  body.recording .big-eye svg { filter: drop-shadow(0 30px 60px rgba(255,69,58,.28)); }
+  .big-eye .shape { transition: opacity .18s; }
+  .big-eye .open { opacity: 0; }
+  .big-eye.is-open .open { opacity: 1; }
+  .big-eye.is-open .closed { opacity: 0; }
+  .big-eye .caption {
+    position: absolute; left: 50%; bottom: -46px; transform: translateX(-50%); white-space: nowrap;
+    font: 400 13px var(--mono); color: var(--dim);
+  }
+  .big-eye .caption b { color: var(--paper); font-weight: 500; }
+
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 90px; background: var(--line); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; animation: fade 1s .8s both; }
+  .mode { background: var(--ink); padding: 26px 28px; text-decoration: none; display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center; transition: background .2s; }
+  .mode:hover { background: var(--ink-2); }
+  .mode .num { font: 400 44px/1 var(--serif); color: var(--amber); font-style: italic; }
+  .mode h3 { font: 600 17px/1.2 var(--sans); }
+  .mode p { margin: 4px 0 0; color: var(--dim); font-size: 14.5px; line-height: 1.45; }
+  .mode .arrow { color: var(--faint); font-size: 22px; transition: transform .2s, color .2s; }
+  .mode:hover .arrow { transform: translateX(4px); color: var(--amber); }
+
+  @keyframes rise { from { transform: translateY(105%); } }
+  @keyframes fade { from { opacity: 0; transform: translateY(12px); } }
+
+  /* ---------- sections ---------- */
+  section.chapter { padding: 130px 0; border-top: 1px solid var(--line); position: relative; }
+  .chapter-num {
+    position: absolute; right: 28px; top: 60px; font: italic 400 clamp(120px, 20vw, 260px)/1 var(--serif);
+    color: transparent; -webkit-text-stroke: 1px var(--line); pointer-events: none; user-select: none;
+  }
+  .reveal { opacity: 0; transform: translateY(24px); transition: opacity .9s ease, transform .9s cubic-bezier(.2,.7,.1,1); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  /* window chrome shared by demos */
+  .window { background: var(--ink-2); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 40px 80px rgba(0,0,0,.45); }
+  .window .bar { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); font: 400 12.5px var(--mono); color: var(--dim); }
+  .window .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a352c; }
+  .window .bar i:nth-child(1) { background: #ff5f57; } .window .bar i:nth-child(2) { background: #febc2e; } .window .bar i:nth-child(3) { background: #28c840; }
+  .window .bar .t { margin-left: 10px; flex: 1; }
+
+  /* ---------- meetings ---------- */
+  .meet-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 28px; margin-top: 60px; align-items: start; }
+  .console { padding: 22px; }
+  .track { display: grid; grid-template-columns: 92px 1fr; gap: 14px; align-items: center; padding: 12px 0; }
+  .track + .track { border-top: 1px dashed var(--line); }
+  .track .who { font: 500 13px/1.3 var(--mono); }
+  .track .who small { display: block; color: var(--faint); font-weight: 400; font-size: 11.5px; }
+  .track.me .who b { color: var(--me); } .track.them .who b { color: var(--them); }
+  .track canvas { width: 100%; height: 64px; display: block; }
+  .console-foot { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding-top: 18px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .status { font: 400 13px var(--mono); color: var(--dim); display: flex; align-items: center; gap: 10px; min-height: 20px; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .status.live .dot { background: var(--rec); animation: pulse 1.2s infinite; }
+  .status.work .dot { background: var(--amber); animation: pulse .7s infinite; }
+  .status.done .dot { background: #28c840; }
+  .rec-btn {
+    all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 10px; padding: 11px 18px; border-radius: 999px;
+    border: 1px solid var(--line); font: 600 14px var(--sans); transition: .2s;
+  }
+  .rec-btn::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--rec); transition: border-radius .2s; }
+  .rec-btn:hover { border-color: var(--dim); }
+  .rec-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  body.recording .rec-btn::before { border-radius: 2px; }
+  .rec-btn[disabled] { opacity: .45; cursor: wait; }
+  .progress { height: 3px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 14px; opacity: 0; transition: opacity .3s; }
+  .progress.show { opacity: 1; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--amber); transition: width .12s linear; }
+
+  .transcript { font: 400 14px/1.7 var(--mono); }
+  .transcript .body { padding: 20px 22px; min-height: 318px; }
+  .transcript .empty { color: var(--faint); }
+  .transcript h4 { font: 500 14px var(--mono); margin: 0 0 12px; color: var(--paper); }
+  .transcript .meta-line { color: var(--faint); margin-bottom: 14px; }
+  .transcript p { margin: 0 0 8px; opacity: 0; transform: translateY(6px); transition: .4s; }
+  .transcript p.in { opacity: 1; transform: none; }
+  .transcript p b { font-weight: 500; }
+  .transcript p .ts { color: var(--faint); margin-right: 8px; }
+  .transcript p.me b { color: var(--me); } .transcript p.them b { color: var(--them); }
+
+  .facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 70px; background: var(--line); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+  .fact { background: var(--ink); padding: 28px; }
+  .fact .k { font: italic 400 38px/1 var(--serif); color: var(--amber); }
+  .fact h3 { font: 600 16px/1.3 var(--sans); margin: 14px 0 6px; }
+  .fact p { margin: 0; color: var(--dim); font-size: 14.5px; line-height: 1.5; }
+
+  .tree { margin-top: 70px; display: grid; grid-template-columns: .8fr 1.2fr; gap: 40px; align-items: center; }
+  .tree h3 { font-size: 40px; line-height: 1.05; }
+  .tree p { color: var(--dim); }
+  .tree pre { margin: 0; padding: 22px 24px; font: 400 14px/1.9 var(--mono); color: var(--dim); overflow-x: auto; }
+  .tree pre b { color: var(--paper); font-weight: 500; }
+  .tree pre em { color: var(--faint); font-style: normal; }
+
+  /* ---------- dictation ---------- */
+  .dict-grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 50px; margin-top: 60px; align-items: center; }
+  .keycap-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 22px; }
+  .keycap {
+    all: unset; cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: none;
+    width: 168px; height: 118px; border-radius: 18px; position: relative;
+    background: linear-gradient(180deg, #2a261f, #1b1813);
+    border: 1px solid #3a342a; box-shadow: 0 10px 0 #0a0907, 0 14px 30px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.07);
+    transition: transform .08s, box-shadow .08s;
+  }
+  .keycap .glyph { position: absolute; right: 18px; top: 14px; font: 400 30px var(--sans); color: var(--paper); }
+  .keycap .word { position: absolute; left: 18px; bottom: 16px; font: 500 13px var(--mono); color: var(--dim); }
+  .keycap .side { position: absolute; left: 18px; top: 18px; font: 500 11px var(--mono); color: var(--amber); letter-spacing: .1em; }
+  .keycap.down { transform: translateY(8px); box-shadow: 0 2px 0 #0a0907, 0 4px 12px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.05); }
+  .keycap.down, .keycap.latched { border-color: var(--amber); }
+  .keycap.latched .side::after { content: " · latched"; color: var(--dim); }
+  .keycap:focus-visible { outline: 2px solid var(--amber); outline-offset: 6px; }
+  .hint { color: var(--dim); font-size: 15px; max-width: 38ch; }
+  .modes-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+  .modes-list li { display: grid; grid-template-columns: 110px 1fr; gap: 14px; font-size: 15px; color: var(--dim); }
+  .modes-list li strong { color: var(--paper); font-weight: 600; }
+
+  .editor .body { padding: 26px 28px 20px; min-height: 250px; font: 400 21px/1.55 var(--sans); }
+  .editor .body .committed { color: var(--paper); }
+  .editor .body .preview { color: var(--dim); text-decoration: underline dotted rgba(255,176,0,.55); text-underline-offset: 5px; }
+  .caret { display: inline-block; width: 2px; height: 1.1em; background: var(--amber); vertical-align: -3px; margin-left: 1px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .editor .foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--line); font: 400 12.5px var(--mono); color: var(--faint); }
+  .meter { display: flex; align-items: center; gap: 3px; height: 18px; }
+  .meter i { width: 3px; height: 3px; background: var(--faint); border-radius: 2px; transition: height .08s; }
+  .editor.live .meter i { background: var(--amber); }
+  .lang { padding: 3px 8px; border-radius: 5px; border: 1px solid var(--line); color: var(--dim); opacity: 0; transition: opacity .3s; }
+  .lang.show { opacity: 1; }
+
+  /* ---------- together ---------- */
+  .together { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; margin-top: 60px; }
+  .card { border-top: 1px solid var(--amber); padding-top: 22px; }
+  .card h3 { font-size: 30px; line-height: 1.1; margin-bottom: 12px; }
+  .card p { color: var(--dim); margin: 0; font-size: 15.5px; }
+
+  /* ---------- private ---------- */
+  .private { text-align: center; padding: 150px 0; }
+  .private h2 { font-size: clamp(52px, 10vw, 150px); max-width: 12ch; margin: 22px auto 30px; }
+  .private .lede { margin: 0 auto; }
+  .chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 44px; }
+  .chip { font: 400 13px var(--mono); padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+
+  /* ---------- install ---------- */
+  .install-grid { display: grid; grid-template-columns: .85fr 1.15fr; gap: 50px; margin-top: 56px; align-items: start; }
+  .steps { list-style: none; counter-reset: s; padding: 0; margin: 0; display: grid; gap: 26px; }
+  .steps li { counter-increment: s; display: grid; grid-template-columns: 44px 1fr; gap: 10px; }
+  .steps li::before { content: counter(s, decimal-leading-zero); font: italic 400 28px/1 var(--serif); color: var(--amber); }
+  .steps h3 { font: 600 16px/1.3 var(--sans); margin-bottom: 4px; }
+  .steps p { margin: 0; color: var(--dim); font-size: 15px; }
+  .code { position: relative; }
+  .code pre { margin: 0; padding: 22px 24px; overflow-x: auto; font: 400 13.5px/1.8 var(--mono); color: var(--paper); }
+  .code pre .c { color: var(--faint); }
+  .code pre .p { color: var(--amber); user-select: none; }
+  .copy {
+    all: unset; cursor: pointer; font: 500 12px var(--mono); color: var(--dim); padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+  }
+  .copy:hover { color: var(--paper); border-color: var(--dim); }
+  .copy:focus-visible { outline: 2px solid var(--amber); }
+  .code + .code { margin-top: 22px; }
+  .reqs { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+
+  footer { border-top: 1px solid var(--line); padding: 50px 0 60px; color: var(--faint); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; align-items: center; }
+  footer .mark { display: flex; align-items: center; gap: 12px; color: var(--paper); font-weight: 600; }
+  footer .mark svg { width: 22px; height: 22px; color: var(--amber); }
+  footer a { color: var(--dim); }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 920px) {
+    .hero-grid, .meet-grid, .dict-grid, .tree, .install-grid { grid-template-columns: 1fr; }
+    .big-eye { order: -1; width: min(240px, 60vw); margin-bottom: 20px; }
+    .big-eye .caption { display: none; }
+    .modes, .facts, .together { grid-template-columns: 1fr; }
+    .menubar nav a:not(.brand):not(.keep) { display: none; }
+    .menu { right: 12px; }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 0 16px; }
+    .menubar { padding: 0 8px; }
+    #clock .date { display: none; }
+    section.chapter { padding: 90px 0; }
+    .mode { grid-template-columns: auto 1fr; }
+    .mode .arrow { display: none; }
+    .track { grid-template-columns: 70px 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+    .reveal { opacity: 1; transform: none; }
+    html { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Icon paths are the exact ones the app draws in the menu bar. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <path id="eye-closed" fill-rule="evenodd" d="M7 2h10a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H7a5 5 0 0 1-5-5V7a5 5 0 0 1 5-5Zm-2 9c3 5.2 11 5.2 14 0-3 3.2-11 3.2-14 0Z"/>
+    <path id="eye-open" fill-rule="evenodd" d="M7 2h10a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H7a5 5 0 0 1-5-5V7a5 5 0 0 1 5-5Zm-2.5 10c3-5.5 12-5.5 15 0-3 5.5-12 5.5-15 0Zm7.5-2.6a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 1 0 0-5.2Z"/>
+  </defs>
+</svg>
+
+<header class="menubar">
+  <nav aria-label="Primary">
+    <a class="brand" href="#top">betterMeet</a>
+    <a href="#meetings">Meetings</a>
+    <a href="#dictation">Dictation</a>
+    <a href="#private">Private</a>
+    <a href="#install" class="keep">Install</a>
+    <a href="https://github.com/flup-repo/betterMeet">GitHub</a>
+  </nav>
+  <div class="tray">
+    <span class="rec-time" id="trayTime">00:00</span>
+    <button class="eye-btn" id="eyeBtn" aria-haspopup="menu" aria-expanded="false" aria-label="betterMeet menu">
+      <svg viewBox="0 0 24 24" fill="currentColor"><use id="trayIcon" href="#eye-closed"/></svg>
+    </button>
+    <span id="clock"></span>
+  </div>
+</header>
+
+<div class="menu" id="menu" role="menu" aria-label="betterMeet">
+  <div class="row label" id="menuState">Idle</div>
+  <div class="row label" id="menuTrans">No transcription running</div>
+  <hr>
+  <button class="row" role="menuitem" id="menuToggle"><span>Start recording</span><span>⌃⌥R</span></button>
+  <button class="row" role="menuitem" id="menuDictate"><span>Start dictation</span><span>Right ⌥</span></button>
+  <hr>
+  <a class="row" role="menuitem" href="#install" style="text-decoration:none"><span>Install…</span><span></span></a>
+</div>
+
+<main id="top">
+
+  <!-- ================= HERO ================= -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <span class="eyebrow">macOS menu-bar app · open source</span>
+          <h1 style="margin-top:26px">
+            <span class="line"><span>Records the meeting.</span></span>
+            <span class="line"><span><em>Types</em> what you say.</span></span>
+          </h1>
+          <p class="lede">betterMeet lives behind one small eye in your menu bar. It captures your meetings, you and them on separate tracks, and turns them into transcripts. Between calls, hold <kbd>Right ⌥</kbd> and it types your words into any app. Recognition runs on your Mac.</p>
+          <div class="hero-ctas">
+            <a class="btn primary" href="#install">Install from source</a>
+            <a class="btn ghost" href="https://github.com/flup-repo/betterMeet">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+              View on GitHub
+            </a>
+          </div>
+          <div class="hero-meta"><span>macOS 15+</span><span>Apple Silicon recommended</span><span>Parakeet v3, on device</span></div>
+        </div>
+        <div class="big-eye" id="bigEye" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <use class="badge shape closed" href="#eye-closed"/>
+            <use class="badge shape open" href="#eye-open"/>
+          </svg>
+          <div class="caption">press <b>⌃⌥R</b> — it's watching now</div>
+        </div>
+      </div>
+
+      <div class="modes">
+        <a class="mode" href="#meetings">
+          <span class="num">i.</span>
+          <div><h3>Meeting recorder</h3><p>Mic and system audio on two tracks, transcribed locally the moment you stop.</p></div>
+          <span class="arrow">→</span>
+        </a>
+        <a class="mode" href="#dictation">
+          <span class="num">ii.</span>
+          <div><h3>Dictation, anywhere</h3><p>Hold Right ⌥ to talk. Words appear at your cursor with a live preview.</p></div>
+          <span class="arrow">→</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= MEETINGS ================= -->
+  <section class="chapter" id="meetings">
+    <span class="chapter-num" aria-hidden="true">i</span>
+    <div class="wrap">
+      <span class="eyebrow reveal">Meetings</span>
+      <h2 class="reveal">Two tracks in.<br><em>One transcript</em> out.</h2>
+      <p class="lede reveal">Click the eye and choose <strong>Start recording</strong>, or press <kbd>⌃⌥R</kbd> from anywhere. betterMeet records your microphone and everything your Mac plays back as separate tracks, so the transcript knows which side said what. Stop, and transcription starts on its own. Try it:</p>
+
+      <div class="meet-grid">
+        <div class="window reveal">
+          <div class="bar"><i></i><i></i><i></i><span class="t">~/Recordings/weekly-sync</span></div>
+          <div class="console">
+            <div class="track me">
+              <div class="who"><b>me</b><small>mic.aac</small></div>
+              <canvas id="waveMe" aria-label="Microphone waveform"></canvas>
+            </div>
+            <div class="track them">
+              <div class="who"><b>them</b><small>system.aac</small></div>
+              <canvas id="waveThem" aria-label="System audio waveform"></canvas>
+            </div>
+            <div class="console-foot">
+              <div class="status" id="meetStatus" aria-live="polite"><span class="dot"></span><span class="txt">Idle. Press ⌃⌥R or the button.</span></div>
+              <button class="rec-btn" id="recBtn">Start recording</button>
+            </div>
+            <div class="progress" id="meetProgress"><i></i></div>
+          </div>
+        </div>
+
+        <div class="window transcript reveal">
+          <div class="bar"><i></i><i></i><i></i><span class="t">transcript.md</span></div>
+          <div class="body" id="transcript">
+            <div class="empty">The transcript appears here once the recording stops.<br><br>Each line is labeled with its track: <b style="color:var(--me)">me</b> for the mic, <b style="color:var(--them)">them</b> for system audio.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="facts">
+        <div class="fact reveal">
+          <div class="k">me / them</div>
+          <h3>Separate tracks, clear sides</h3>
+          <p>Mic and system audio are recorded and transcribed on their own. The labels identify tracks, not individual people.</p>
+        </div>
+        <div class="fact reveal">
+          <div class="k">10 min</div>
+          <h3>Stops when the room goes quiet</h3>
+          <p>After ten silent minutes on both tracks, recording stops. A notification warns you a minute ahead, and any sound cancels it. Four hours is the hard cap.</p>
+        </div>
+        <div class="fact reveal">
+          <div class="k">--retry</div>
+          <h3>Re-transcribe any time</h3>
+          <p>Run <code>betterMeet transcribe</code> on an old session with another model or settings. The originals stay untouched, and failed tracks resume from checkpoints.</p>
+        </div>
+      </div>
+
+      <div class="tree">
+        <div class="reveal">
+          <h3>Plain files,<br><em style="color:var(--amber)">yours to keep.</em></h3>
+          <p>Every session is a folder under <code>~/Recordings</code>: the audio, a readable transcript, and a structured JSON version for your own tools. No database or export step, and nothing to sync.</p>
+        </div>
+        <div class="window reveal">
+          <div class="bar"><i></i><i></i><i></i><span class="t">Finder</span></div>
+<pre><b>~/Recordings/</b>
+└── <b>SESSION/</b>
+    ├── mic.aac            <em># your microphone</em>
+    ├── system.aac         <em># everything your Mac played</em>
+    ├── <b>transcript.md</b>      <em># readable, labeled me / them</em>
+    ├── transcript.json    <em># structured, with diagnostics</em>
+    ├── meta.json          <em># recording metadata</em>
+    └── transcribe.log     <em># processing status</em></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DICTATION ================= -->
+  <section class="chapter" id="dictation">
+    <span class="chapter-num" aria-hidden="true">ii</span>
+    <div class="wrap">
+      <span class="eyebrow reveal">Dictation</span>
+      <h2 class="reveal">Hold a key.<br><em>Say it.</em> Let go.</h2>
+      <p class="lede reveal">Put the cursor in any text field, in any app. Hold <kbd>Right ⌥</kbd> and speak, and the words stream in as a live preview, then settle when you let go. The left Option key keeps working as usual.</p>
+
+      <div class="dict-grid">
+        <div class="keycap-wrap reveal">
+          <button class="keycap" id="keycap" aria-label="Hold to dictate (demo)">
+            <span class="side">RIGHT</span>
+            <span class="glyph">⌥</span>
+            <span class="word">option</span>
+          </button>
+          <p class="hint">Hold the key above, or <strong>Right ⌥</strong> on your keyboard, to try it. Tap once to latch it on, and tap again to stop.</p>
+          <ul class="modes-list">
+            <li><strong>Hold</strong>Push-to-talk. Dictation runs while the key is down.</li>
+            <li><strong>Tap</strong>Stays on until your next tap.</li>
+            <li><strong>Fallback</strong>If an app blocks insertion, the text goes to your clipboard.</li>
+          </ul>
+        </div>
+
+        <div class="window editor reveal" id="editor">
+          <div class="bar"><i></i><i></i><i></i><span class="t">Notes — Untitled</span></div>
+          <div class="body" aria-live="polite"><span class="committed" id="committed"></span><span class="preview" id="preview"></span><span class="caret"></span></div>
+          <div class="foot">
+            <div class="meter" id="meter" aria-hidden="true"></div>
+            <span class="lang" id="lang">EN</span>
+            <span id="dictState">Idle</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="facts" style="margin-top:80px">
+        <div class="fact reveal">
+          <div class="k">25</div>
+          <h3>European languages, detected</h3>
+          <p>Dictation uses multilingual Parakeet v3 and detects the language on its own. No switching, no settings.</p>
+        </div>
+        <div class="fact reveal">
+          <div class="k">warm</div>
+          <h3>Ready when you are</h3>
+          <p>Models stay loaded for five minutes after your last dictation, so the next one starts instantly. Set it to <code>0</code> to free memory right away.</p>
+        </div>
+        <div class="fact reveal">
+          <div class="k">bench</div>
+          <h3>Measure it yourself</h3>
+          <p><code>betterMeet dictation-benchmark</code> times recognition on your own sample and reports word error rate against a reference.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TOGETHER ================= -->
+  <section class="chapter" id="together">
+    <div class="wrap">
+      <span class="eyebrow reveal">One package</span>
+      <h2 class="reveal">A recorder and a dictation tool.<br><em>One small binary.</em></h2>
+      <div class="together">
+        <div class="card reveal">
+          <h3>Built to share</h3>
+          <p>Meetings and dictation run on the same local engine. A dictation can run between the two meeting tracks, so you don't wait for the whole transcript.</p>
+        </div>
+        <div class="card reveal">
+          <h3>Out of the way</h3>
+          <p>No Dock icon and no main window. A LaunchAgent starts it at login, and the menu shows what it's doing: recording, transcribing a track, or dictating.</p>
+        </div>
+        <div class="card reveal">
+          <h3>One file to install</h3>
+          <p>The icons, the Info.plist and the permissions metadata are all compiled into a single executable in <code>/usr/local/bin</code>. There's no separate resource bundle to install.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PRIVATE ================= -->
+  <section class="chapter private" id="private">
+    <div class="wrap">
+      <span class="eyebrow reveal">Private by design</span>
+      <h2 class="reveal">Your meetings stay <em>on your Mac.</em></h2>
+      <p class="lede reveal">Speech is recognized on your Mac. Model weights download once, on first use, and after that your audio and transcripts stay in folders you own. You don't need an account or an API key.</p>
+      <div class="chips reveal">
+        <span class="chip">on-device inference</span>
+        <span class="chip">plain files in ~/Recordings</span>
+        <span class="chip">no account</span>
+        <span class="chip">open source</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= INSTALL ================= -->
+  <section class="chapter" id="install">
+    <span class="chapter-num" aria-hidden="true">⌥</span>
+    <div class="wrap">
+      <span class="eyebrow reveal">Install</span>
+      <h2 class="reveal">Build it. <em>Blink.</em> Done.</h2>
+      <p class="lede reveal">betterMeet builds from source with Swift 6. The steps below install the binary and a LaunchAgent that starts it at every login.</p>
+
+      <div class="install-grid">
+        <ol class="steps reveal">
+          <li><div><h3>Clone and build</h3><p>From the repository root. If you're updating, stop any recording and quit the app first.</p></div></li>
+          <li><div><h3>Install through a fresh file</h3><p>Replacing the running binary in place trips macOS code signing. Copying to a temporary file and moving it into place avoids that.</p></div></li>
+          <li><div><h3>Grant permissions</h3><p>Allow microphone and system audio the first time you record. Right ⌥ dictation also needs Accessibility and Input Monitoring.</p></div></li>
+          <li><div><h3>Look for the eye</h3><p>It's closed while idle and opens while it works.</p></div></li>
+        </ol>
+
+        <div class="reveal">
+          <div class="window code">
+            <div class="bar"><i></i><i></i><i></i><span class="t">zsh</span><button class="copy" data-copy="build">Copy</button></div>
+<pre id="build"><span class="p">$ </span>git clone https://github.com/flup-repo/betterMeet.git
+<span class="p">$ </span>cd betterMeet
+<span class="p">$ </span>swift build -c release
+<span class="p">$ </span>sudo mkdir -p /usr/local/bin
+<span class="p">$ </span>tmp=$(sudo mktemp /usr/local/bin/betterMeet.XXXXXX) &amp;&amp;
+    sudo install -o root -g wheel -m 755 .build/release/betterMeet "$tmp" &amp;&amp;
+    sudo mv -f "$tmp" /usr/local/bin/betterMeet &amp;&amp;
+    /usr/local/bin/betterMeet install --launch-at-login</pre>
+          </div>
+          <div class="window code">
+            <div class="bar"><i></i><i></i><i></i><span class="t">~/.config/betterMeet/config.json · optional</span><button class="copy" data-copy="cfg">Copy</button></div>
+<pre id="cfg">{
+  "mic_voice_processing": false,      <span class="c">// echo cancellation for speakers</span>
+  "dictation_max_seconds": 600,
+  "inactivity_timeout_seconds": 600,  <span class="c">// auto-stop after silence</span>
+  "max_duration_seconds": 14400,      <span class="c">// 4 h hard cap</span>
+  "inference_idle_seconds": 300,      <span class="c">// keep models warm</span>
+  "transcription": {
+    "model": "v3",                    <span class="c">// v3 multilingual · v2 English</span>
+    "speech_detection": "annotate"
+  }
+}</pre>
+          </div>
+          <div class="reqs">
+            <span class="chip">macOS 15 or later</span>
+            <span class="chip">Swift 6</span>
+            <span class="chip">Apple Silicon recommended</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="mark"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><use href="#eye-closed"/></svg> betterMeet</div>
+    <div>Built with Swift and <a href="https://github.com/FluidInference/FluidAudio">FluidAudio</a> · <a href="https://github.com/flup-repo/betterMeet">Source on GitHub</a></div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- menu-bar clock ---------- */
+  const clock = $('#clock');
+  const tick = () => {
+    const d = new Date();
+    const date = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+    const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    clock.innerHTML = `<span class="date">${date}&nbsp;&nbsp;</span>${time}`;
+  };
+  tick(); setInterval(tick, 10000);
+
+  /* ---------- menu ---------- */
+  const eyeBtn = $('#eyeBtn'), menu = $('#menu');
+  const setMenu = (open) => { menu.classList.toggle('open', open); eyeBtn.setAttribute('aria-expanded', open); };
+  eyeBtn.addEventListener('click', (e) => { e.stopPropagation(); setMenu(!menu.classList.contains('open')); });
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target)) setMenu(false); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenu(false); });
+  $('#menuToggle').addEventListener('click', () => { setMenu(false); toggleRecording(); });
+  $('#menuDictate').addEventListener('click', () => { setMenu(false); document.getElementById('dictation').scrollIntoView(); setTimeout(() => latchToggle(), 700); });
+
+  /* ---------- eye state (tray + hero) ---------- */
+  const bigEye = $('#bigEye'), trayIcon = $('#trayIcon');
+  let working = 0; // recording + dictation share the open eye, like the app
+  const syncEye = () => {
+    const open = working > 0;
+    trayIcon.setAttribute('href', open ? '#eye-open' : '#eye-closed');
+    bigEye.classList.toggle('is-open', open);
+  };
+  const busy = (d) => { working = Math.max(0, working + d); syncEye(); };
+  // idle blink: the hero eye peeks open now and then
+  if (!reduced) setInterval(() => {
+    if (working || document.hidden) return;
+    bigEye.classList.add('is-open');
+    setTimeout(() => { if (!working) bigEye.classList.remove('is-open'); }, 900);
+  }, 5200);
+
+  /* ---------- reveal on scroll ---------- */
+  const io = new IntersectionObserver((es) => es.forEach((e) => {
+    if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+  }), { threshold: .15 });
+  document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+
+  /* ---------- waveforms ---------- */
+  const makeWave = (canvas, color) => {
+    const ctx = canvas.getContext('2d');
+    const bars = [];
+    let w = 0, h = 0, n = 0;
+    const size = () => {
+      const r = devicePixelRatio || 1;
+      w = canvas.clientWidth; h = canvas.clientHeight;
+      canvas.width = w * r; canvas.height = h * r; ctx.setTransform(r, 0, 0, r, 0, 0);
+      n = Math.floor(w / 5);
+      while (bars.length < n) bars.unshift(0.04);
+      while (bars.length > n) bars.shift();
+    };
+    size(); addEventListener('resize', size);
+    return {
+      push(v) { bars.push(v); if (bars.length > n) bars.shift(); },
+      draw(dim) {
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = color; ctx.globalAlpha = dim ? .35 : 1;
+        bars.forEach((v, i) => {
+          const bh = Math.max(2, v * h * .92);
+          ctx.fillRect(i * 5, (h - bh) / 2, 3, bh);
+        });
+      },
+    };
+  };
+  const css = getComputedStyle(document.documentElement);
+  const waveMe = makeWave($('#waveMe'), css.getPropertyValue('--me').trim());
+  const waveThem = makeWave($('#waveThem'), css.getPropertyValue('--them').trim());
+
+  /* ---------- meeting demo ---------- */
+  const recBtn = $('#recBtn'), status = $('#meetStatus'), prog = $('#meetProgress'), transcript = $('#transcript');
+  const trayTime = $('#trayTime'), menuState = $('#menuState'), menuTrans = $('#menuTrans'), menuToggle = $('#menuToggle');
+  const setStatus = (cls, txt) => { status.className = 'status ' + cls; status.querySelector('.txt').textContent = txt; };
+  const LINES = [
+    ['them', '00:04', 'Morning. Can everyone hear me okay?'],
+    ['me',   '00:07', 'Loud and clear. Shall we start with the release?'],
+    ['them', '00:11', 'Sure. The build is green and QA signed off yesterday.'],
+    ['me',   '00:16', 'Great, then let’s ship Thursday and write the notes today.'],
+    ['them', '00:21', 'Works for me. I’ll send the checklist after this call.'],
+  ];
+  let recording = false, phase = 'idle', started = 0, speaker = 'them', turnLeft = 40;
+  const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+
+  function toggleRecording() {
+    if (phase === 'transcribing') return;
+    recording ? stopRecording() : startRecording();
+  }
+  function startRecording() {
+    recording = true; phase = 'recording'; started = Date.now();
+    document.body.classList.add('recording'); busy(+1);
+    recBtn.textContent = 'Stop recording'; menuToggle.firstElementChild.textContent = 'Stop recording';
+    menuState.textContent = 'Recording 00:00'; menuTrans.textContent = 'No transcription running';
+    setStatus('live', 'Recording 00:00');
+    prog.classList.remove('show');
+    transcript.innerHTML = '<div class="empty">Listening… the transcript appears here after you stop.</div>';
+  }
+  function stopRecording() {
+    recording = false; phase = 'transcribing';
+    document.body.classList.remove('recording');
+    recBtn.textContent = 'Start recording'; recBtn.disabled = true; menuToggle.firstElementChild.textContent = 'Start recording';
+    menuState.textContent = 'Idle';
+    prog.classList.add('show');
+    const bar = prog.firstElementChild;
+    const runTrack = (name, done) => {
+      let p = 0;
+      const step = () => {
+        p = Math.min(100, p + 2 + Math.random() * 5);
+        bar.style.width = p + '%';
+        setStatus('work', `Transcribing ${name}… ${Math.round(p)}%`);
+        menuTrans.textContent = `Transcribing ${name} ${Math.round(p)}%`;
+        p < 100 ? setTimeout(step, 45) : done();
+      };
+      step();
+    };
+    runTrack('me', () => runTrack('them', finish));
+  }
+  function finish() {
+    phase = 'idle'; busy(-1); recBtn.disabled = false;
+    prog.classList.remove('show');
+    menuTrans.textContent = 'Transcript ready';
+    setStatus('done', 'Done. transcript.md written.');
+    transcript.innerHTML = '<h4># weekly-sync</h4><div class="meta-line">status: complete · model: v3</div>';
+    LINES.forEach(([who, ts, text], i) => {
+      const p = document.createElement('p');
+      p.className = who;
+      p.innerHTML = `<span class="ts">${ts}</span><b>${who}:</b> ${text}`;
+      transcript.appendChild(p);
+      setTimeout(() => p.classList.add('in'), 120 + i * 170);
+    });
+  }
+  recBtn.addEventListener('click', toggleRecording);
+
+  let last = 0;
+  const loop = (t) => {
+    if (t - last > 55) {
+      last = t;
+      if (recording) {
+        if (--turnLeft <= 0) { speaker = speaker === 'me' ? 'them' : 'me'; turnLeft = 25 + Math.random() * 45; }
+        const talk = () => Math.min(1, .2 + Math.random() * .75 * (0.6 + Math.sin(t / 180) * .4));
+        const idle = () => .03 + Math.random() * .05;
+        waveMe.push(speaker === 'me' ? talk() : idle());
+        waveThem.push(speaker === 'them' ? talk() : idle());
+        const s = Math.floor((Date.now() - started) / 1000);
+        trayTime.textContent = fmt(s); menuState.textContent = `Recording ${fmt(s)}`;
+        setStatus('live', `Recording ${fmt(s)}`);
+      }
+      waveMe.draw(!recording); waveThem.draw(!recording);
+    }
+    requestAnimationFrame(loop);
+  };
+  // seed with a quiet, flat line
+  for (let i = 0; i < 240; i++) { waveMe.push(.04); waveThem.push(.04); }
+  requestAnimationFrame(loop);
+
+  /* ---------- dictation demo ---------- */
+  const keycap = $('#keycap'), editor = $('#editor'), committed = $('#committed'), preview = $('#preview');
+  const meter = $('#meter'), lang = $('#lang'), dictState = $('#dictState'), menuDictate = $('#menuDictate');
+  for (let i = 0; i < 18; i++) meter.appendChild(document.createElement('i'));
+  const PHRASES = [
+    ['EN', 'Remind the team that the release moves to Thursday.'],
+    ['DE', 'Das Protokoll schicke ich heute Nachmittag herum.'],
+    ['FR', 'On se retrouve juste après la démo de demain.'],
+    ['ES', 'Revisa el presupuesto antes de la reunión del lunes.'],
+    ['EN', 'Also, book the big room for Friday at ten.'],
+  ];
+  let phraseIdx = 0, words = [], wordIdx = 0, dictating = false, wordTimer = null, meterTimer = null;
+  let downAt = 0, latched = false;
+
+  function startDictation() {
+    if (dictating) return;
+    dictating = true; busy(+1);
+    const [code, text] = PHRASES[phraseIdx++ % PHRASES.length];
+    words = text.split(' '); wordIdx = 0;
+    if (committed.textContent && !committed.textContent.endsWith(' ')) committed.textContent += ' ';
+    preview.textContent = '';
+    editor.classList.add('live'); dictState.textContent = 'Listening…';
+    menuDictate.firstElementChild.textContent = 'Stop dictation';
+    lang.textContent = code; lang.classList.remove('show');
+    wordTimer = setInterval(() => {
+      if (wordIdx < words.length) {
+        preview.textContent += (wordIdx ? ' ' : '') + words[wordIdx++];
+        if (wordIdx === 2) lang.classList.add('show');
+      }
+    }, 210);
+    meterTimer = setInterval(() => {
+      meter.querySelectorAll('i').forEach((b) => { b.style.height = (3 + Math.random() * 15) + 'px'; });
+    }, 90);
+  }
+  function stopDictation() {
+    if (!dictating) return;
+    dictating = false; busy(-1);
+    clearInterval(wordTimer); clearInterval(meterTimer);
+    meter.querySelectorAll('i').forEach((b) => { b.style.height = '3px'; });
+    editor.classList.remove('live');
+    menuDictate.firstElementChild.textContent = 'Start dictation';
+    dictState.textContent = 'Recognizing…';
+    setTimeout(() => {
+      // final pass: the settled text replaces the preview
+      committed.textContent += words.join(' ') + ' ';
+      preview.textContent = '';
+      dictState.textContent = 'Inserted';
+      if (committed.textContent.length > 260) committed.textContent = committed.textContent.slice(-180).replace(/^\S*\s/, '');
+    }, 260);
+  }
+  function latchToggle() {
+    latched = !latched; keycap.classList.toggle('latched', latched);
+    latched ? startDictation() : stopDictation();
+  }
+  const press = () => {
+    if (downAt) return;
+    downAt = performance.now(); keycap.classList.add('down');
+    if (!latched) startDictation();
+  };
+  const release = () => {
+    if (!downAt) return;
+    const held = performance.now() - downAt; downAt = 0; keycap.classList.remove('down');
+    if (latched) { latchToggle(); return; }       // tap while latched: stop
+    if (held < 280) { latched = true; keycap.classList.add('latched'); return; } // short tap: keep going
+    stopDictation();                                // hold: push-to-talk
+  };
+  keycap.addEventListener('pointerdown', (e) => { e.preventDefault(); keycap.setPointerCapture(e.pointerId); press(); });
+  keycap.addEventListener('pointerup', release);
+  keycap.addEventListener('pointercancel', release);
+  keycap.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); press(); } });
+  keycap.addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Enter') release(); });
+
+  /* ---------- global shortcuts, same as the app ---------- */
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR' && e.ctrlKey && e.altKey) { e.preventDefault(); toggleRecording(); return; }
+    if (e.code === 'AltRight' && !e.repeat) { e.preventDefault(); press(); }
+  });
+  document.addEventListener('keyup', (e) => { if (e.code === 'AltRight') { e.preventDefault(); release(); } });
+  addEventListener('blur', () => { if (downAt) release(); });
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll('.copy').forEach((b) => b.addEventListener('click', async () => {
+    const pre = document.getElementById(b.dataset.copy).cloneNode(true);
+    pre.querySelectorAll('.p, .c').forEach((n) => n.remove());
+    const text = pre.textContent.replace(/[ \t]+$/gm, '');
+    try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+    catch { b.textContent = 'Select & copy'; }
+    setTimeout(() => (b.textContent = 'Copy'), 1600);
+  }));
+})();
+</script>
+</body>
+</html>
