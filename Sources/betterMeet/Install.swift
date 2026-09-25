@@ -19,9 +19,7 @@ struct Install: ParsableCommand {
 
     func run() throws {
         if launchAtLogin == uninstall {
-            FileHandle.standardError.write(Data(
-                "specify exactly one of --launch-at-login or --uninstall\n".utf8
-            ))
+            Log.write("specify exactly one of --launch-at-login or --uninstall\n")
             throw ExitCode(64)
         }
 
@@ -72,9 +70,7 @@ struct Install: ParsableCommand {
         _ = runLaunchctl(["bootout", "gui/\(uid())", url.path])
         let result = runLaunchctl(["bootstrap", "gui/\(uid())", url.path])
         if result.status != 0 {
-            FileHandle.standardError.write(Data(
-                "warning: launchctl bootstrap exited \(result.status):\n\(result.stderr)\n".utf8
-            ))
+            Log.write("warning: launchctl bootstrap exited \(result.status):\n\(result.stderr)\n")
         }
 
         print("✓ launch-at-login installed")
@@ -104,14 +100,10 @@ struct Install: ParsableCommand {
         // Fall back to the running executable's resolved path.
         let argv0 = CommandLine.arguments.first ?? "betterMeet"
         if argv0.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: argv0) {
-            FileHandle.standardError.write(Data(
-                "note: /usr/local/bin/betterMeet not found; using \(argv0)\n".utf8
-            ))
+            Log.write("note: /usr/local/bin/betterMeet not found; using \(argv0)\n")
             return argv0
         }
-        FileHandle.standardError.write(Data(
-            "couldn't locate the betterMeet binary. install it to /usr/local/bin/betterMeet first.\n".utf8
-        ))
+        Log.write("couldn't locate the betterMeet binary. install it to /usr/local/bin/betterMeet first.\n")
         throw ExitCode(1)
     }
 

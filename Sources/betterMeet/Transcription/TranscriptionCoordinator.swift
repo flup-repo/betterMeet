@@ -21,7 +21,8 @@ actor TranscriptionCoordinator {
 
     enum Status: Sendable {
         case idle
-        case transcribing(session: String, queued: Int)
+        /// `detail` is e.g. "track 1/2 · 40%" once the worker reports it.
+        case transcribing(session: String, queued: Int, detail: String?)
         case failed(session: String)
     }
 
@@ -80,9 +81,7 @@ actor TranscriptionCoordinator {
             queue.append(dir)
         }
         if !pending.isEmpty {
-            FileHandle.standardError.write(Data(
-                "resuming \(pending.count) untranscribed session(s)\n".utf8
-            ))
+            Log.write("resuming \(pending.count) untranscribed session(s)\n")
         }
         drainIfIdle()
     }
@@ -101,7 +100,7 @@ actor TranscriptionCoordinator {
             let dir = queue[queueIndex]
             queueIndex += 1
             let remaining = queue.count - queueIndex
-            publish(.transcribing(session: dir.lastPathComponent, queued: remaining))
+            publish(.transcribing(session: dir.lastPathComponent, queued: remaining, detail: nil))
             do {
                 let transcribed = dir.appendingPathComponent(".transcribed")
                 if !FileManager.default.fileExists(atPath: transcribed.path) {
@@ -132,9 +131,27 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
+    /// One worker request per track, then one that assembles the transcript
+    /// from their checkpoints, so dictation can run between tracks.
     private func transcribe(_ dir: URL) async throws {
+        let settings = try Config.transcriptionSettings()
+        let tracks = try SessionMeta.read(from: dir).tracks
+        let session = dir.lastPathComponent
+        for (index, track) in tracks.enumerated() {
+            let step = "track \(index + 1)/\(tracks.count)"
+            let remaining = queue.count - queueIndex
+            publish(.transcribing(session: session, queued: remaining, detail: step))
+            _ = try await InferenceService.shared.request(
+                InferenceRequest(operation: .meeting, source: dir, output: dir, settings: settings,
+                                 track: track.speaker)
+            ) { [weak self] progress in
+                Task {
+                    await self?.progress(session: session, step: step, value: progress)
+                }
+            }
+        }
         _ = try await InferenceService.shared.request(InferenceRequest(
-            operation: .meeting, source: dir, output: dir, settings: Config.transcriptionSettings()
+            operation: .meeting, source: dir, output: dir, settings: settings
         ))
         let document = try JSONDecoder().decode(
             TranscriptDocument.self, from: Data(contentsOf: dir.appendingPathComponent("transcript.json"))
@@ -170,6 +187,12 @@ actor TranscriptionCoordinator {
         } else {
             try? Data(line.utf8).write(to: url)
         }
+    }
+
+    private func progress(session: String, step: String, value: Double) {
+        guard draining else { return }
+        publish(.transcribing(session: session, queued: queue.count - queueIndex,
+                              detail: "\(step) · \(Int((value * 100).rounded()))%"))
     }
 
     private func publish(_ status: Status) {

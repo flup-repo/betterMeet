@@ -40,7 +40,10 @@ Recordings are saved under `~/Recordings/`. Each session contains:
 - `meta.json` and `transcribe.log`: recording metadata and processing status.
 
 The labels identify tracks, not individual people. Check JSON for track errors
-if the transcript reports `partial` or `failed`.
+if the transcript reports `partial` or `failed`. The system track is mixed to
+mono by averaging both channels. The menu shows which track is being
+transcribed and its progress. Dictation can run between the two tracks
+instead of waiting for the whole transcript.
 
 ## Dictate into a text field
 
@@ -87,6 +90,7 @@ Configuration is optional. These are the defaults; merge changes into
   "dictation_max_seconds": 600,
   "inactivity_timeout_seconds": 600,
   "max_duration_seconds": 14400,
+  "inference_idle_seconds": 300,
   "transcription": {
     "model": "v3",
     "speech_detection": "annotate"
@@ -103,6 +107,11 @@ Configuration is optional. These are the defaults; merge changes into
   making any sound cancels it. The default is 600 seconds (10 minutes).
 - `max_duration_seconds` is a hard cap on recording length regardless of
   activity. The default is 14400 seconds (4 hours).
+- `inference_idle_seconds` keeps the recognition models loaded this long
+  after the last dictation, so the next one starts instantly. `0` unloads them
+  right away to save memory, at the cost of a slower next dictation. After a
+  meeting transcript is finished, the models are always unloaded unless a
+  dictation or another meeting is waiting.
 - `annotate` flags suspicious audio without removing words. `off` disables speech
   detection; experimental `filter` excludes non-speech spans from the readable
   transcript while retaining them in JSON.
@@ -139,7 +148,14 @@ launchctl print "gui/$(id -u)/com.flup-repo.betterMeet"
 tail -n 30 /tmp/betterMeet.err.log
 ```
 
-Expect `state = running` and `recording controls ready` in the log. For permission
+Expect `state = running` and `recording controls ready` in the log. The same
+messages go to the unified log:
+
+```sh
+log stream --predicate 'subsystem == "com.flup-repo.betterMeet"'
+```
+
+At startup the daemon clears `/tmp/betterMeet.err.log` once it passes 5 MB. For permission
 or folder checks, run `/usr/local/bin/betterMeet doctor`. Do not start a second
 menu-bar instance alongside the LaunchAgent.
 

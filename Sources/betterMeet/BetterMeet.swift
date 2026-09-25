@@ -54,11 +54,12 @@ struct Run: ParsableCommand {
 
     @MainActor
     private static func runMain(root: URL) throws {
+        Log.trimErrorLog()
         // Non-blocking: permissions prompt on first recording, so warnings at
         // startup are informational, not fatal.
         let checks = DoctorReport.run(recordingsRoot: root)
         if !DoctorReport.allOK(checks) {
-            FileHandle.standardError.write(Data("startup checks failed:\n".utf8))
+            Log.write("startup checks failed:\n")
             DoctorReport.print(checks)
             throw ExitCode(1)
         }
@@ -69,7 +70,7 @@ struct Run: ParsableCommand {
         let controller = AppController(root: root)
 
         let shutdownHandler = {
-            FileHandle.standardError.write(Data("\nshutting down\n".utf8))
+            Log.write("\nshutting down\n")
             MainActor.assumeIsolated { controller.shutdown() }
         }
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -81,9 +82,7 @@ struct Run: ParsableCommand {
         sigterm.resume()
         signal(SIGTERM, SIG_IGN)
 
-        FileHandle.standardError.write(Data(
-            "betterMeet up · recordings → \(root.path) · ^C to quit\n".utf8
-        ))
+        Log.write("betterMeet up · recordings → \(root.path) · ^C to quit\n")
         app.run()
     }
 }
@@ -139,7 +138,7 @@ final class AppController {
             await transcription.resumePending(root: root)
             await MainActor.run { [weak self] in
                 self?.menuBar.onToggle = { [weak self] in self?.toggle() }
-                FileHandle.standardError.write(Data("recording controls ready\n".utf8))
+                Log.write("recording controls ready\n")
             }
         }
     }
@@ -189,9 +188,9 @@ final class AppController {
             try newSession.start()
             session = newSession
             inactivityWarnedFor = nil
-            FileHandle.standardError.write(Data("● recording → \(newSession.dir.path)\n".utf8))
+            Log.write("● recording → \(newSession.dir.path)\n")
         } catch {
-            FileHandle.standardError.write(Data("recording start failed: \(error)\n".utf8))
+            Log.write("recording start failed: \(error)\n")
             notifyUser(title: "betterMeet — recording failed", body: "\(error)")
             return
         }
@@ -210,9 +209,7 @@ final class AppController {
         self.session = nil
         session.stop(failure: failure)
         let elapsed = Self.format(Date().timeIntervalSince(session.startedAt))
-        FileHandle.standardError.write(Data(
-            "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
-        ))
+        Log.write("○ stopped · \(elapsed) · \(session.dir.path)\n")
         ticker?.invalidate()
         ticker = nil
         menuBar.update(recording: false, elapsed: nil)
@@ -228,10 +225,11 @@ final class AppController {
         switch status {
         case .idle:
             menuBar.updateTranscription(nil)
-        case .transcribing(let name, let queued):
-            menuBar.updateTranscription(
-                queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)"
-            )
+        case .transcribing(let name, let queued, let detail):
+            var parts = ["transcribing \(name)"]
+            if let detail { parts.append(detail) }
+            if queued > 0 { parts.append("\(queued) queued") }
+            menuBar.updateTranscription(parts.joined(separator: " · "))
         case .failed(let name):
             menuBar.updateTranscription("transcription failed · \(name)")
         }

@@ -208,9 +208,7 @@ final class MenuBarController {
             &eventHandlerRef
         )
         guard handlerStatus == noErr else {
-            FileHandle.standardError.write(Data(
-                "warning: couldn't install recording shortcut handler (\(handlerStatus))\n".utf8
-            ))
+            Log.write("warning: couldn't install recording shortcut handler (\(handlerStatus))\n")
             return
         }
 
@@ -224,9 +222,7 @@ final class MenuBarController {
             &hotKeyRef
         )
         if hotKeyStatus != noErr {
-            FileHandle.standardError.write(Data(
-                "warning: couldn't register Control + Option + R (\(hotKeyStatus))\n".utf8
-            ))
+            Log.write("warning: couldn't register Control + Option + R (\(hotKeyStatus))\n")
         }
     }
 
@@ -243,9 +239,7 @@ final class MenuBarController {
         ) else {
             dictationShortcutAvailable = false
             refresh()
-            FileHandle.standardError.write(Data(
-                "warning: couldn't create right-option dictation event tap\n".utf8
-            ))
+            Log.write("warning: couldn't create right-option dictation event tap\n")
             return
         }
         dictationEventTap = tap
@@ -304,7 +298,8 @@ final class MenuBarController {
         cancelDictationItem.isHidden = !dictation.isBusy
         cancelDictationItem.isEnabled = dictation.canCancel
         if let button = statusItem.button {
-            button.image = recording || dictation.isBusy ? Self.eyesOpenImage() : Self.eyesClosedImage()
+            let image = recording || dictation.isBusy ? Self.eyesOpenImage() : Self.eyesClosedImage()
+            if button.image !== image { button.image = image }
         }
         recordingRow?.syncLabels()
         dictationRow?.syncLabels()
@@ -333,9 +328,11 @@ final class MenuBarController {
     </svg>
     """
 
-    private static func eyesClosedImage() -> NSImage? {
-        svgImage(eyesClosedSVG)
-    }
+    /// Parsed once: refresh() runs every second while recording.
+    private static let eyesClosed = svgImage(eyesClosedSVG)
+    private static let eyesOpen = svgImage(eyesOpenSVG)
+
+    private static func eyesClosedImage() -> NSImage? { eyesClosed }
 
     /// Open eyes: the recording-state variant. Stays a template image so
     /// macOS recolors it for the menu bar appearance.
@@ -350,9 +347,7 @@ final class MenuBarController {
     </svg>
     """
 
-    private static func eyesOpenImage() -> NSImage? {
-        svgImage(eyesOpenSVG)
-    }
+    private static func eyesOpenImage() -> NSImage? { eyesOpen }
 
     private static func svgImage(_ svg: String) -> NSImage? {
         guard let data = svg.data(using: .utf8),
@@ -393,6 +388,15 @@ final class MenuBarController {
     private static let dictationTapCallback:
         @convention(c) (CGEventTapProxy, CGEventType, CGEvent, UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>?
         = { _, type, event, userInfo in
+        // macOS disables a tap whose callback is slow (or on some user input)
+        // and never re-enables it; without this Right ⌥ stays dead until restart.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let userInfo {
+                let controller = Unmanaged<MenuBarController>.fromOpaque(userInfo).takeUnretainedValue()
+                controller.reenableDictationTap()
+            }
+            return Unmanaged.passUnretained(event)
+        }
         guard let userInfo, type == .flagsChanged,
               event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_RightOption)
         else { return Unmanaged.passUnretained(event) }
@@ -407,8 +411,18 @@ final class MenuBarController {
         return nil
     }
 
+    private func reenableDictationTap() {
+        guard let dictationEventTap else { return }
+        Log.write("warning: right-option event tap was disabled by macOS; re-enabling")
+        CGEvent.tapEnable(tap: dictationEventTap, enable: true)
+        // The release may have been lost while the tap was off; a stale "held"
+        // entry would swallow the next press.
+        heldHotKeys.remove(2)
+        dictationKeyPressDate = nil
+    }
+
     private func handleDictationPress() {
-        FileHandle.standardError.write(Data("dictation hotkey press state=\(dictation)\n".utf8))
+        Log.write("dictation hotkey press state=\(dictation)\n")
         if dictation.isBusy {
             // A second press stops the current dictation; the matching release
             // must not toggle it again.
@@ -424,7 +438,7 @@ final class MenuBarController {
         defer { dictationKeyPressDate = nil }
         guard let pressedAt = dictationKeyPressDate else { return }
         let elapsed = Date().timeIntervalSince(pressedAt)
-        FileHandle.standardError.write(Data("dictation hotkey release elapsed=\(elapsed)\n".utf8))
+        Log.write("dictation hotkey release elapsed=\(elapsed)\n")
         if DictationShortcut.shouldStopOnRelease(elapsed: elapsed, state: dictation) {
             onDictation?()
         }

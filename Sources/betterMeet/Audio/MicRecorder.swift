@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 
@@ -102,9 +103,7 @@ final class MicRecorder: @unchecked Sendable {
                 input.voiceProcessingOtherAudioDuckingConfiguration =
                     .init(enableAdvancedDucking: false, duckingLevel: .min)
             } catch {
-                FileHandle.standardError.write(Data(
-                    "warning: mic voice processing unavailable (\(error)) — recording raw mic\n".utf8
-                ))
+                Log.write("warning: mic voice processing unavailable (\(error)) — recording raw mic\n")
                 voice = false
             }
         }
@@ -182,7 +181,7 @@ final class MicRecorder: @unchecked Sendable {
 
         let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
             + "input=\(input.outputFormat(forBus: 0)) recording=\(recordingFormat)\n"
-        FileHandle.standardError.write(Data(report.utf8))
+        Log.write(report)
     }
 
     /// Voice-processing path: the unit converts to the mono client format
@@ -215,11 +214,7 @@ final class MicRecorder: @unchecked Sendable {
 
             if !self.livenessSettled {
                 let frames = Int(buffer.frameLength)
-                if let data = buffer.floatChannelData?[0] {
-                    for i in 0..<frames {
-                        self.livenessPeak = max(self.livenessPeak, abs(data[i]))
-                    }
-                }
+                self.livenessPeak = max(self.livenessPeak, Self.peak(of: buffer))
                 self.livenessFrames += frames
                 if self.livenessFrames >= checkFrames {
                     self.livenessSettled = true
@@ -301,14 +296,21 @@ final class MicRecorder: @unchecked Sendable {
     static let activityThreshold: Float = 0.01
 
     /// Peak amplitude across all float channels, or 0 if the format isn't
-    /// float (never happens with the formats we record).
-    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
-        guard let data = buffer.floatChannelData else { return 0 }
+    /// float (never happens with the formats we record). Shared with the
+    /// system track; vDSP keeps this cheap on the audio threads.
+    static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
+        let interleaved = buffer.format.isInterleaved
+        let channels = Int(buffer.format.channelCount)
         var peak: Float = 0
-        for channel in 0..<Int(buffer.format.channelCount) {
-            for i in 0..<Int(buffer.frameLength) {
-                peak = max(peak, abs(data[channel][i]))
+        for channel in 0..<channels {
+            var channelPeak: Float = 0
+            if interleaved {
+                vDSP_maxmgv(data[0] + channel, channels, &channelPeak, vDSP_Length(buffer.frameLength))
+            } else {
+                vDSP_maxmgv(data[channel], 1, &channelPeak, vDSP_Length(buffer.frameLength))
             }
+            peak = max(peak, channelPeak)
         }
         return peak
     }
@@ -362,7 +364,7 @@ final class MicRecorder: @unchecked Sendable {
         writeFailed = true
         let message = "mic track write failed: \(error)"
         DispatchQueue.main.async { [weak self] in
-            FileHandle.standardError.write(Data("\(message)\n".utf8))
+            Log.write("\(message)\n")
             self?.onFailure?(message)
         }
     }
@@ -377,7 +379,7 @@ final class MicRecorder: @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isRecording else { return }
                 let message = String(describing: RecorderError.configurationChanged)
-                FileHandle.standardError.write(Data("\(message)\n".utf8))
+                Log.write("\(message)\n")
                 self.onFailure?(message)
             }
         }
@@ -397,9 +399,7 @@ final class MicRecorder: @unchecked Sendable {
         guard isRecording else { return }
         voiceProcessingActive = false
         voiceProcessingFallback = true
-        FileHandle.standardError.write(Data(
-            "warning: voice processing delivered silence — restarting mic raw\n".utf8
-        ))
+        Log.write("warning: voice processing delivered silence — restarting mic raw\n")
         removeConfigurationObserver()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
@@ -412,9 +412,7 @@ final class MicRecorder: @unchecked Sendable {
         do {
             try attach(voiceProcessing: false)
         } catch {
-            FileHandle.standardError.write(Data(
-                "mic raw fallback failed: \(error) — session continues without mic track\n".utf8
-            ))
+            Log.write("mic raw fallback failed: \(error) — session continues without mic track\n")
             file = nil
         }
     }

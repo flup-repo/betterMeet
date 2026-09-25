@@ -272,7 +272,7 @@ struct DictationDestination {
 
     private static func diagnostic(_ message: String, app: String?) {
         // Attribute availability and app identity only, never text or clipboard contents.
-        FileHandle.standardError.write(Data("dictation destination: \(message) app=\(app ?? "unknown")\n".utf8))
+        Log.write("dictation destination: \(message) app=\(app ?? "unknown")\n")
     }
 
     private static func string(_ element: AXUIElement, _ attribute: String) -> String? {

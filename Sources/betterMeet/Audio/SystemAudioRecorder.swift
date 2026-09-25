@@ -1,13 +1,16 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import os
 
 /// Records all system audio output to a file via a Core Audio process tap
 /// (macOS 14.2+). No virtual device, no kernel extension — the tap mixes every
 /// process's output to stereo and hands us buffers through a private aggregate
 /// device. First use triggers the one-time "System Audio Recording" TCC prompt
 /// and lights the purple recording indicator while active.
-final class SystemAudioRecorder {
+/// Unchecked, like MicRecorder: each capture field is written from one queue
+/// (IO or writer) and only read elsewhere for status and metadata.
+final class SystemAudioRecorder: @unchecked Sendable {
     enum RecorderError: Error, CustomStringConvertible {
         case tapCreationFailed(OSStatus)
         case tapFormatUnreadable(OSStatus)
@@ -36,6 +39,10 @@ final class SystemAudioRecorder {
     private var procID: AudioDeviceIOProcID?
     private var file: AVAudioFile?
     private let queue = DispatchQueue(label: "com.flup-repo.betterMeet.system-tap")
+    /// AAC encoding and file I/O run here, not in the Core Audio IO cycle:
+    /// the IO proc only copies PCM into a preallocated buffer.
+    private let writerQueue = DispatchQueue(label: "com.flup-repo.betterMeet.system-writer", qos: .userInitiated)
+    private var pool: PCMBufferPool?
     private(set) var isRecording = false
     private var failed = false
     var onFailure: (@Sendable (String) -> Void)?
@@ -84,6 +91,8 @@ final class SystemAudioRecorder {
         if let procID, aggregateID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateID, procID)
         }
+        // Let queued buffers reach the file before it is closed.
+        writerQueue.sync {}
         cleanup()
     }
 
@@ -146,26 +155,34 @@ final class SystemAudioRecorder {
     }
 
     private func installIOProc(format: AVAudioFormat) throws {
+        // ~5 s of backlog at typical 512-frame IO cycles, ~4 MB for stereo.
+        let pool = PCMBufferPool(format: format, frameCapacity: 4096, count: 128)
+        self.pool = pool
         var status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, queue) {
             [weak self] _, inInputData, inInputTime, _, _ in
-            guard let self, let file = self.file, !self.failed else { return }
+            guard let self, self.file != nil, !self.failed else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
             if self.firstBufferHostTime == nil,
                inInputTime.pointee.mFlags.contains(.hostTimeValid) {
                 self.firstBufferHostTime = inInputTime.pointee.mHostTime
             }
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                bufferListNoCopy: inInputData,
-                deallocator: nil
-            ) else { return }
-            do {
-                try file.write(from: buffer)
-                if Self.peak(of: buffer) > MicRecorder.activityThreshold {
-                    self.lastActivityAt = Date()
+            guard let copied = pool.copy(inInputData) else {
+                self.reportDrop()
+                return
+            }
+            // Owned by the writer until recycled; the IO proc never touches it again.
+            nonisolated(unsafe) let buffer = copied
+            self.writerQueue.async { [weak self] in
+                defer { pool.recycle(buffer) }
+                guard let self, let file = self.file, !self.failed else { return }
+                do {
+                    try file.write(from: buffer)
+                    if MicRecorder.peak(of: buffer) > MicRecorder.activityThreshold {
+                        self.lastActivityAt = Date()
+                    }
+                } catch {
+                    self.reportFailure(RecorderError.writeFailed(error))
                 }
-            } catch {
-                self.reportFailure(RecorderError.writeFailed(error))
             }
         }
         guard status == noErr, let procID else { throw RecorderError.ioProcCreationFailed(status) }
@@ -174,24 +191,23 @@ final class SystemAudioRecorder {
         guard status == noErr else { throw RecorderError.deviceStartFailed(status) }
     }
 
-    /// Peak amplitude across all float channels, or 0 if the format isn't
-    /// float (the tap always delivers float32).
-    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
-        guard let data = buffer.floatChannelData else { return 0 }
-        var peak: Float = 0
-        for channel in 0..<Int(buffer.format.channelCount) {
-            for i in 0..<Int(buffer.frameLength) {
-                peak = max(peak, abs(data[channel][i]))
-            }
+    private var droppedBuffers = 0
+
+    /// The writer fell more than the pool behind. Losing a slice beats
+    /// blocking the IO cycle; log the first drop and every 100th after.
+    private func reportDrop() {
+        droppedBuffers += 1
+        if droppedBuffers == 1 || droppedBuffers % 100 == 0 {
+            let count = droppedBuffers
+            Log.write("warning: system audio writer behind; dropped \(count) buffer(s)")
         }
-        return peak
     }
 
     private func reportFailure(_ error: Error) {
         guard !failed else { return }
         failed = true
         let message = String(describing: error)
-        FileHandle.standardError.write(Data("\(message)\n".utf8))
+        Log.write("\(message)\n")
         let handler = onFailure
         DispatchQueue.main.async {
             handler?(message)
@@ -212,5 +228,63 @@ final class SystemAudioRecorder {
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
         file = nil
+        pool = nil
+    }
+}
+
+/// Fixed set of PCM buffers handed from the IO proc to the writer queue, so
+/// the IO cycle never allocates. Oversized cycles get a one-off buffer.
+private final class PCMBufferPool: @unchecked Sendable {
+    private let format: AVAudioFormat
+    private let frameCapacity: AVAudioFrameCount
+    // A plain unfair lock around the free list: AVAudioPCMBuffer isn't
+    // Sendable, so Mutex's region checks reject it. Held only for push/pop.
+    private let lock = OSAllocatedUnfairLock()
+    private var free: [AVAudioPCMBuffer]
+
+    init(format: AVAudioFormat, frameCapacity: AVAudioFrameCount, count: Int) {
+        self.format = format
+        self.frameCapacity = frameCapacity
+        let buffers = (0..<count).compactMap { _ in
+            AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)
+        }
+        free = buffers
+    }
+
+    /// Copy one IO cycle's buffer list, or nil when every buffer is in use.
+    func copy(_ source: UnsafePointer<AudioBufferList>) -> AVAudioPCMBuffer? {
+        let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: source))
+        let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
+        guard bytesPerFrame > 0, let first = input.first else { return nil }
+        let frames = AVAudioFrameCount(Int(first.mDataByteSize) / bytesPerFrame)
+        guard frames > 0 else { return nil }
+        let target: AVAudioPCMBuffer?
+        if frames <= frameCapacity {
+            lock.lock()
+            target = free.popLast()
+            lock.unlock()
+        } else {
+            target = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)
+        }
+        guard let target else { return nil }
+        let output = UnsafeMutableAudioBufferListPointer(target.mutableAudioBufferList)
+        for index in 0..<min(input.count, output.count) {
+            // Non-interleaved formats carry one channel per buffer; bytesPerFrame
+            // is per buffer either way.
+            let bytes = min(input[index].mDataByteSize, UInt32(Int(target.frameCapacity) * bytesPerFrame))
+            if let destination = output[index].mData, let origin = input[index].mData {
+                memcpy(destination, origin, Int(bytes))
+            }
+            output[index].mDataByteSize = bytes
+        }
+        target.frameLength = frames
+        return target
+    }
+
+    func recycle(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.frameCapacity == frameCapacity else { return }
+        lock.lock()
+        free.append(buffer)
+        lock.unlock()
     }
 }

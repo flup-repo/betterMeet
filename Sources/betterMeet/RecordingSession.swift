@@ -80,7 +80,7 @@ final class RecordingSession {
             try writeMetadata(endedAt: ended, failure: failure)
         } catch {
             let message = String(describing: error)
-            FileHandle.standardError.write(Data("\(message)\n".utf8))
+            Log.write("\(message)\n")
             onFailure?(message)
         }
     }
